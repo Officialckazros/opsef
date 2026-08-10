@@ -33,7 +33,6 @@ jobs:
 
       - name: Build
         working-directory: desktoppet
-        shell: ${{ matrix.os == 'windows-latest' && 'pwsh' || 'bash' }}
         run: ${{ matrix.command }}
 
       - name: Upload release asset
