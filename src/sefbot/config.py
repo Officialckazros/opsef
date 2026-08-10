@@ -52,11 +52,6 @@ CELERIS_BASE_URL = (
 ).rstrip("/")
 
 GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
-if not INCEPTION_API_KEY and not GROQ_API_KEY and not CELERIS_API_KEY:
-    raise RuntimeError(
-        "Need INCEPTION_API_KEY (Mercury), CELERIS_API_KEY, and/or GROQ_API_KEY. "
-        "Copy .env.example to .env and fill it in."
-    )
 
 _extra_keys = os.getenv("GROQ_API_KEYS", "")
 GROQ_KEYS = []

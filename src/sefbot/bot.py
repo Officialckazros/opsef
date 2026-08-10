@@ -21,6 +21,7 @@ import discord
 from sefbot import actions
 from sefbot import ai
 from sefbot import auditlog
+from sefbot import blocked
 from sefbot import brain
 from sefbot import config
 from sefbot import customcmds
