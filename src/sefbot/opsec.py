@@ -4,9 +4,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import config
+from sefbot import config
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent.parent
 DATA_PATH = ROOT / "opsec" / "data.json"
 
 OPSEC_OWNER_ID = "1534261140077678602"

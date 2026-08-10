@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Dict, Optional, Set
 
-BLOCKED_FILE = Path(__file__).resolve().parent / "blocked_users.json"
+BLOCKED_FILE = Path(__file__).resolve().parent.parent.parent / "blocked_users.json"
 
 _cache_ids: Optional[Set[str]] = None
 _cache_meta: Optional[Dict[str, dict]] = None

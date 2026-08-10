@@ -2,8 +2,8 @@
 
 Two ways to use it:
 
-    python seed_religion.py                # load the built-in starter corpus
-    python seed_religion.py ./my_texts     # also ingest every .md/.txt/.markdown
+    PYTHONPATH=src python -m sefbot.fuck_religion                # load the built-in starter corpus
+    PYTHONPATH=src python -m sefbot.fuck_religion ./my_texts     # also ingest every .md/.txt/.markdown
                                            # file in that folder (topic = filename)
 
 "Every single piece of information about religion" is not a finite thing anyone
@@ -20,7 +20,7 @@ discuss religion respectfully, also soften that persona line.
 import os
 import sys
 
-import kb
+from sefbot import kb
 
 CORPUS = {
     "Religion (overview)": """

@@ -8,7 +8,7 @@ Usage:
     tos help                  This help
 
 Also:
-    python3 tos_cli.py break
+    PYTHONPATH=src python -m sefbot.tos_cli break
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import blocked
+from sefbot import blocked
 
 HELP = """\
 OpSef ToS break review CLI
@@ -67,7 +67,7 @@ def _discord_token() -> str:
     try:
         from dotenv import load_dotenv
 
-        load_dotenv(Path(__file__).resolve().parent / ".env")
+        load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
     except Exception:
         pass
     return (os.getenv("DISCORD_TOKEN") or "").strip()
@@ -78,14 +78,14 @@ def _db_path() -> Path:
     try:
         from dotenv import load_dotenv
 
-        load_dotenv(Path(__file__).resolve().parent / ".env")
+        load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
     except Exception:
         pass
     raw = (os.getenv("SEFBOT_DB") or "").strip()
     if raw:
         p = Path(raw)
-        return p if p.is_absolute() else Path(__file__).resolve().parent / p
-    return Path(__file__).resolve().parent / "sefbot.db"
+        return p if p.is_absolute() else Path(__file__).resolve().parent.parent.parent / p
+    return Path(__file__).resolve().parent.parent.parent / "sefbot.db"
 
 
 def _kv_rows(like: str, value: Optional[str] = None) -> List[Tuple[str, str]]:

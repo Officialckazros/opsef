@@ -8,10 +8,10 @@ is DATA (a prompt), never executable code.
 import re
 from typing import Optional, Tuple
 
-import ai
-import brain
-import config
-import db
+from sefbot import ai
+from sefbot import brain
+from sefbot import config
+from sefbot import db
 
 RESERVED = {
     "help", "teach", "forget", "memory", "memories", "about", "request",

@@ -13,10 +13,10 @@ import re
 import time
 from typing import List, Optional
 
-import ai
-import config
-import db
-import kb
+from sefbot import ai
+from sefbot import config
+from sefbot import db
+from sefbot import kb
 
 
 def get_mood(guild_id: str) -> dict:

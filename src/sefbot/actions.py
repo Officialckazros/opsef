@@ -19,7 +19,7 @@ from typing import List, Optional, Union
 
 import discord
 
-import config
+from sefbot import config
 
 _PERMS = {
     "kick_user": "kick_members",
@@ -549,7 +549,7 @@ async def _one(
     if t == "dm_user":
         if not target:
             return f"dm: target user '{raw_target or ''}' not found"
-        import db as _db
+        from sefbot import db as _db
 
         if _db.user_flag_get(str(target.id), "dm_block") == "1":
             return (

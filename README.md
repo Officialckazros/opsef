@@ -39,7 +39,7 @@ Community-made commands via `!request` are prompt specs, not code — the AI gen
 cp .env.example .env
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python bot.py
+PYTHONPATH=src python -m sefbot.bot
 ```
 
 ## Commands
@@ -50,7 +50,7 @@ python bot.py
 
 Separate from the memory system — this is a real retrieval store (SQLite FTS5, BM25 ranked, no cap on size, unlike memories which decay). Relevant chunks get pulled into the prompt as facts the bot should treat as ground truth.
 
-`python seed_religion.py` loads the built-in starter corpus. Point it at a folder — `python seed_religion.py ./texts` — and it'll ingest every `.md`/`.txt` file in there too.
+`PYTHONPATH=src python -m sefbot.fuck_religion` loads the built-in starter corpus. Point it at a folder — `PYTHONPATH=src python -m sefbot.fuck_religion ./texts` — and it'll ingest every `.md`/`.txt` file in there too.
 
 In Discord, mods can do `!kb add <topic> | <text>` or attach a file to `!kb add`. Anyone can run `!kb search <query>` or just `!kb` for stats. `SEFBOT_KB_TOPK` controls how many chunks get injected per message (default 6).
 
@@ -64,6 +64,8 @@ Check [TOPGG.md](./TOPGG.md) for the full checklist. Worth knowing up front:
 
 ## Where things live
 
+All bot code lives in `src/opsef/` (run with `PYTHONPATH=src python -m sefbot.bot`).
+
 - `bot.py` — Discord glue: chat, embeds, reaction feedback, commands, the reflection loop
 - `brain.py` — system prompt construction, memory retrieval, leveling, reflection
 - `actions.py` — permission-gated moderation/status actions and chart URLs
@@ -71,10 +73,10 @@ Check [TOPGG.md](./TOPGG.md) for the full checklist. Worth knowing up front:
 - `customcmds.py` — AI-generated, prompt-defined community commands
 - `db.py` — SQLite persistence with in-place migration
 - `kb.py` — the uncapped knowledge base (chunking, FTS5, BM25 retrieval)
-- `seed_religion.py` — loads the KB with a starter corpus or a folder of text
+- `fuck_religion.py` — seeds the KB with a starter corpus or a folder of text
 - `ai.py` — async Groq wrapper for chat and structured JSON
 - `config.py` — env config and the persona
 
 ## Deploying on Railway
 
-Ships with `railway.json` set up as a worker running `python bot.py`. Since the brain lives in SQLite, you need a persistent volume — point `SEFBOT_DB` at `/data/sefbot.db` on a mounted volume or everything it's learned gets wiped on redeploy. `db.py` handles migrating an older database in place on startup.
+Ships with `railway.json` set up as a worker running `PYTHONPATH=src python -m sefbot.bot`. Since the brain lives in SQLite, you need a persistent volume — point `SEFBOT_DB` at `/data/sefbot.db` on a mounted volume or everything it's learned gets wiped on redeploy. `db.py` handles migrating an older database in place on startup.

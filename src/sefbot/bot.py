@@ -18,19 +18,19 @@ from typing import List, Optional
 
 import discord
 
-import actions
-import ai
-import auditlog
-import brain
-import config
-import customcmds
-import db
-import embeds
-import kb
-import music
-import opsec
-import slash
-import tos
+from sefbot import actions
+from sefbot import ai
+from sefbot import auditlog
+from sefbot import brain
+from sefbot import config
+from sefbot import customcmds
+from sefbot import db
+from sefbot import embeds
+from sefbot import kb
+from sefbot import music
+from sefbot import opsec
+from sefbot import slash
+from sefbot import tos
 try:
     import importlib
     langdetect = importlib.import_module("langdetect")
@@ -97,7 +97,7 @@ _lurk_channels = {}
 
 UP, DOWN = "\U0001F44D", "\U0001F44E"
 
-_CLI_ACTIVE_FILE = Path(__file__).parent / "cli_active_chats.json"
+_CLI_ACTIVE_FILE = Path(__file__).resolve().parent.parent.parent / "cli_active_chats.json"
 _CLI_ACTIVE_TTL = 90
 
 
@@ -2063,7 +2063,7 @@ async def _cmd_kb(message, arg, guild_id, author):
             await _send(message.channel, embeds.say(
                 f"knowledge base is empty. mods can load it: "
                 f"`{p}kb add <topic> | <text>`, attach a .md/.txt file, or run "
-                f"`python seed_religion.py` on the host.", title="knowledge base"
+                f"`PYTHONPATH=src python -m sefbot.fuck_religion` on the host.", title="knowledge base"
             ), feedback=False)
             return
         top_lines = "\n".join(f"- {t['topic']} ({t['passages']})" for t in tops[:20])
@@ -2386,7 +2386,7 @@ async def _cmd_unblock(message, arg, guild_id, author):
         await _send(message.channel, embeds.error(f"usage: `{config.PREFIX}unblock <user_id>`"), feedback=False)
         return
     try:
-        import tos_cli
+        from sefbot import tos_cli
         rc = tos_cli.cmd_break_unblock([arg.strip()], notify=True)
         if rc == 0:
             await _send(message.channel, embeds.ok(f"unblocked user `{arg.strip()}` and notified them."), feedback=False)
@@ -2408,7 +2408,7 @@ async def _cmd_block(message, arg, guild_id, author):
     target_id = parts[0]
     reason = parts[1] if len(parts) > 1 else "manual block by owner"
     try:
-        import block_cli
+        from sefbot import block_cli
         rc = block_cli.cmd_access([target_id, reason])
         if rc == 0:
             await _send(message.channel, embeds.ok(f"blocked user `{target_id}` (**{reason}**)."), feedback=False)
@@ -2432,7 +2432,7 @@ async def _cmd_tos(message, arg, guild_id, author):
         target = raw_parts[2] if len(raw_parts) > 2 else ""
 
         try:
-            import tos_cli
+            from sefbot import tos_cli
             entries = tos_cli.collect_tos_blocks()
             if not entries:
                 await _send(message.channel, embeds.say("no ToS-blocked users currently recorded.", title="tos break review"), feedback=False)

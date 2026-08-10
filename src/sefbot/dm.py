@@ -1,13 +1,13 @@
 """Interactive CLI for DMing Discord users through the SefBot bot account.
 
 Full interactive shell (recommended):
-    python3 dm.py
+    PYTHONPATH=src python -m sefbot.dm
 
 Jump straight into a chat with one user:
-    python3 dm.py <user_id>
+    PYTHONPATH=src python -m sefbot.dm <user_id>
 
 Fire a single message and exit, no shell:
-    python3 dm.py <user_id> "message text"
+    PYTHONPATH=src python -m sefbot.dm <user_id> "message text"
 """
 import argparse
 import asyncio
@@ -20,14 +20,14 @@ from typing import Optional
 
 import discord
 
-import config
+from sefbot import config
 
 INTENTS = discord.Intents.default()
 INTENTS.dm_messages = True
 
-CONTACTS_FILE = Path(__file__).parent / "dm_contacts.json"
+CONTACTS_FILE = Path(__file__).resolve().parent.parent.parent / "dm_contacts.json"
 
-ACTIVE_CHATS_FILE = Path(__file__).parent / "cli_active_chats.json"
+ACTIVE_CHATS_FILE = Path(__file__).resolve().parent.parent.parent / "cli_active_chats.json"
 ACTIVE_HEARTBEAT_SECONDS = 20
 
 HELP_TEXT = """\

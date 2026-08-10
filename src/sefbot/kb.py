@@ -21,7 +21,7 @@ so it persists on the same Railway volume with zero extra config.
 import re
 from typing import List, Optional
 
-import db
+from sefbot import db
 
 _HAS_FTS5: Optional[bool] = None
 _READY = False

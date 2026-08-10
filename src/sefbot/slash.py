@@ -15,19 +15,19 @@ from typing import Callable, Optional
 import discord
 from discord import app_commands
 
-import actions
-import ai
-import auditlog
-import brain
-import config
-import customcmds
-import db
-import embeds
-import kb
-import music
-import opsec
+from sefbot import actions
+from sefbot import ai
+from sefbot import auditlog
+from sefbot import brain
+from sefbot import config
+from sefbot import customcmds
+from sefbot import db
+from sefbot import embeds
+from sefbot import kb
+from sefbot import music
+from sefbot import opsec
 import random
-import tos
+from sefbot import tos
 
 UP, DOWN = "\U0001F44D", "\U0001F44E"
 

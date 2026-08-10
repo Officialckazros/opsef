@@ -18,7 +18,7 @@ from typing import List, Optional, Union
 
 from groq import Groq
 
-import config
+from sefbot import config
 
 _clients = [
     Groq(api_key=k, timeout=20.0, max_retries=0) for k in config.GROQ_KEYS

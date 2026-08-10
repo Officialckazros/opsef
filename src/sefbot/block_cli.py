@@ -9,7 +9,7 @@ Usage:
 Also accepted forms:
     block access <user_id>
     block <user_id>                 shorthand for `block access`
-    python3 block_cli.py access <user_id>
+    PYTHONPATH=src python -m sefbot.block_cli access <user_id>
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-import blocked
+from sefbot import blocked
 
 
 HELP = """\
@@ -63,7 +63,7 @@ def cmd_access(args: list[str]) -> int:
     from pathlib import Path
 
     owner = (os.getenv("SEFBOT_OWNER_ID") or "1172433512364769342").strip()
-    env_path = Path(__file__).resolve().parent / ".env"
+    env_path = Path(__file__).resolve().parent.parent.parent / ".env"
     if env_path.exists():
         try:
             for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -107,7 +107,7 @@ def cmd_unblock(args: list[str]) -> int:
 
     ok = blocked.unblock_user(uid)
     try:
-        import tos_cli
+        from sefbot import tos_cli
         tos_cli._clear_tos_side_effects(uid)
     except Exception:
         pass

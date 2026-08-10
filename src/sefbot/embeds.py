@@ -4,7 +4,7 @@ import re
 
 import discord
 
-import config
+from sefbot import config
 
 _EMOJI = re.compile(
     "["

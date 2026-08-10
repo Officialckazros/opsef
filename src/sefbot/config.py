@@ -195,13 +195,13 @@ def is_blocked(user_id) -> bool:
     if uid in BLOCKED_USER_IDS:
         return True
     try:
-        from blocked import is_dynamically_blocked
+        from sefbot.blocked import is_dynamically_blocked
         if is_dynamically_blocked(uid):
             return True
     except Exception:
         pass
     try:
-        import tos as _tos
+        from sefbot import tos as _tos
         if _tos.is_emergency_blocked(uid):
             return True
     except Exception:

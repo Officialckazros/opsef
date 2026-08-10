@@ -19,7 +19,7 @@ import sqlite3
 import time
 from typing import List, Optional
 
-import config
+from sefbot import config
 
 _conn: Optional[sqlite3.Connection] = None
 

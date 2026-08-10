@@ -130,7 +130,7 @@ tos break unblock <id>   Unblock one user + DM them access restored.
 tos break unblock all    Unblock all ToS blocks (confirm) + DM each.
                          Pass --no-dm to skip the notify.
 
-(Also: `python3 block_cli.py access <user_id>` / `python3 tos_cli.py break`
+(Also: `PYTHONPATH=src python -m sefbot.block_cli access <user_id>` / `PYTHONPATH=src python -m sefbot.tos_cli break`
  from the project dir.)
 
 ==============================================================================

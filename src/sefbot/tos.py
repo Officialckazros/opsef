@@ -12,8 +12,8 @@ import re
 import time
 from typing import Optional, Tuple
 
-import config
-import db
+from sefbot import config
+from sefbot import db
 
 TOS_VERSION = "1.0"
 TOS_URL = "https://wearegays.net/opsef-tos.html"
@@ -237,7 +237,7 @@ def hard_block(
     db.user_flag_set(uid, "tos_emergency_block", "1")
 
     try:
-        import blocked
+        from sefbot import blocked
         return blocked.block_user(
             uid,
             reason=tos_reason[:250],
