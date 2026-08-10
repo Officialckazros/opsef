@@ -1,0 +1,12 @@
+.env
+*.db
+*.db-journal
+__pycache__/
+*.pyc
+.venv/
+venv/
+dm_contacts.json
+cli_active_chats.json
+blocked_users.json
+blocked_users.json.tmp
+.wrangler/

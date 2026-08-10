@@ -1,0 +1,1116 @@
+"""Thin async wrapper around the Groq API (OpenAI-compatible chat completions).
+
+Everything runs in a thread pool because the Groq SDK is sync and we live inside
+discord.py's event loop.
+
+Model routing
+-------------
+* smart  — main brain / chat / recap / hard tasks  (MODEL_SMART)
+* fast   — cheap tasks: custom cmds, lurk one-liners, simple tools (MODEL_FAST)
+* vision — image understanding when attachments are present (MODEL_VISION)
+"""
+import asyncio
+import concurrent.futures
+import json
+import re
+import threading
+from typing import List, Optional, Union
+
+from groq import Groq
+
+import config
+
+_clients = [
+    Groq(api_key=k, timeout=20.0, max_retries=0) for k in config.GROQ_KEYS
+]
+_idx_lock = threading.Lock()
+_idx = 0
+
+_pool_n = (
+    max(len(_clients), 1)
+    + (1 if config.INCEPTION_API_KEY else 0)
+    + (1 if config.CELERIS_API_KEY else 0)
+)
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=max(16, 4 * _pool_n), thread_name_prefix="llm"
+)
+
+_ROTATE_ON = ("rate limit", "rate_limit", "429", "too many requests",
+              "503", "502", "overloaded", "capacity", "try again")
+
+ContentPart = Union[str, dict]
+
+
+def _next_index() -> int:
+    global _idx
+    with _idx_lock:
+        i = _idx
+        _idx = (_idx + 1) % len(_clients)
+    return i
+
+
+def _is_rate_limited(e: Exception) -> bool:
+    return any(s in str(e).lower() for s in _ROTATE_ON)
+
+
+def _is_gemini(model: str) -> bool:
+    return str(model).startswith("gemini")
+
+
+def _is_mercury(model: str) -> bool:
+    """Inception Mercury models (text). Accepts mercury-2, mercury:*, inception/*."""
+    m = str(model or "").strip().lower()
+    if not m:
+        return False
+    if m.startswith("mercury:") or m.startswith("inception/"):
+        return True
+    if m in ("mercury-2", "mercury", "mercury-2-instant", "mercury-instant"):
+        return True
+    if m.startswith("mercury-"):
+        return True
+    return False
+
+
+def _mercury_upstream_model(model: str) -> str:
+    """Map alias → Inception model id (always mercury-2 today)."""
+    m = str(model or "").strip()
+    if m.startswith("mercury:"):
+        m = m[len("mercury:") :]
+    if m.startswith("inception/"):
+        m = m[len("inception/") :]
+    if m in ("mercury", "mercury-2-instant", "mercury-instant", "mercury-2", "") or m.startswith(
+        "mercury-"
+    ):
+        return "mercury-2"
+    return m or "mercury-2"
+
+
+import http.client
+import queue
+import urllib.parse
+
+class HTTPSConnectionPool:
+    def __init__(self, base_url: str, timeout: float = 15.0, max_size: int = 20):
+        parsed = urllib.parse.urlparse(base_url)
+        self.host = parsed.netloc or "api.inceptionlabs.ai"
+        self.path_prefix = parsed.path.rstrip("/")
+        self.timeout = timeout
+        self.pool = queue.Queue(maxsize=max_size)
+
+    def get(self) -> http.client.HTTPSConnection:
+        try:
+            return self.pool.get_nowait()
+        except queue.Empty:
+            return http.client.HTTPSConnection(self.host, timeout=self.timeout)
+
+    def put(self, conn: http.client.HTTPSConnection):
+        try:
+            self.pool.put_nowait(conn)
+        except queue.Full:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+_mercury_pool = HTTPSConnectionPool(config.INCEPTION_BASE_URL, timeout=15.0, max_size=20)
+_celeris_pool = HTTPSConnectionPool(config.CELERIS_BASE_URL, timeout=15.0, max_size=20)
+
+
+def _is_celeris(model: str) -> bool:
+    """Celeris-1 diffusion LLM. Accepts celeris-1, celeris:*, celeris/*."""
+    m = str(model or "").strip().lower()
+    if not m:
+        return False
+    if m.startswith("celeris:") or m.startswith("celeris/"):
+        return True
+    return m in ("celeris-1", "celeris", "celeris1")
+
+
+def _celeris_upstream_model(model: str) -> str:
+    m = str(model or "").strip()
+    if m.startswith("celeris:"):
+        m = m[len("celeris:") :]
+    if m.startswith("celeris/"):
+        m = m[len("celeris/") :]
+    if m in ("celeris", "celeris1", "celeris-1", ""):
+        return "celeris-1"
+    return m or "celeris-1"
+
+
+def _flatten_message_content(content) -> str:
+    if isinstance(content, list):
+        return " ".join(
+            p.get("text", "")
+            for p in content
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+    return str(content or "")
+
+
+def _celeris_generate(model, system, messages, max_tokens, temperature) -> str:
+    """Celeris-1 (OpenAI-compatible chat completions) via Keep-Alive pool."""
+    if not config.CELERIS_API_KEY:
+        raise RuntimeError("no celeris api key configured")
+
+    full = ([{"role": "system", "content": system}] if system else []) + [
+        {
+            "role": m.get("role", "user"),
+            "content": _flatten_message_content(m.get("content")),
+        }
+        for m in messages
+    ]
+    for msg in full:
+        if not isinstance(msg.get("content"), str):
+            msg["content"] = str(msg.get("content") or "")
+
+    body = {
+        "model": _celeris_upstream_model(model),
+        "messages": full,
+        "max_tokens": max(int(max_tokens), 64),
+        "temperature": float(temperature) if temperature is not None else 0.7,
+    }
+    data = json.dumps(body).encode("utf-8")
+    endpoint = f"{_celeris_pool.path_prefix}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {config.CELERIS_API_KEY}",
+        "Content-Type": "application/json",
+        "User-Agent": "SefBot/1.0",
+    }
+
+    raw = None
+    for attempt in range(2):
+        conn = _celeris_pool.get()
+        try:
+            conn.request("POST", endpoint, body=data, headers=headers)
+            res = conn.getresponse()
+            raw_bytes = res.read()
+            if res.status >= 400:
+                detail = raw_bytes.decode("utf-8", "ignore")[:300]
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                raise RuntimeError(f"celeris {res.status}: {detail}")
+            _celeris_pool.put(conn)
+            raw = raw_bytes.decode("utf-8")
+            break
+        except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError):
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if attempt == 1:
+                raise
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+
+    if not raw:
+        raise RuntimeError("celeris: empty response")
+    d = json.loads(raw)
+    if "choices" not in d:
+        raise RuntimeError(f"celeris: {json.dumps(d.get('error', d))[:200]}")
+    text = (d["choices"][0].get("message") or {}).get("content")
+    if not text or not str(text).strip():
+        raise RuntimeError("celeris: empty content")
+    return str(text).strip()
+
+
+def _mercury_generate(model, system, messages, max_tokens, temperature) -> str:
+    """Inception Labs Mercury (OpenAI-compatible chat completions) with ultra-fast Keep-Alive pooling."""
+    if not config.INCEPTION_API_KEY:
+        raise RuntimeError("no inception/mercury api key configured")
+
+    full = ([{"role": "system", "content": system}] if system else []) + [
+        {
+            "role": m.get("role", "user"),
+            "content": (
+                " ".join(
+                    p.get("text", "")
+                    for p in m.get("content")
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+                if isinstance(m.get("content"), list)
+                else m.get("content")
+            ),
+        }
+        for m in messages
+    ]
+    for msg in full:
+        if not isinstance(msg.get("content"), str):
+            msg["content"] = str(msg.get("content") or "")
+
+    body = {
+        "model": _mercury_upstream_model(model),
+        "messages": full,
+        "max_tokens": max(int(max_tokens), 256),
+        "temperature": float(temperature) if temperature is not None else 0.75,
+        "reasoning_effort": config.MERCURY_REASONING_EFFORT or "instant",
+    }
+    data = json.dumps(body).encode("utf-8")
+    endpoint = f"{_mercury_pool.path_prefix}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {config.INCEPTION_API_KEY}",
+        "Content-Type": "application/json",
+        "User-Agent": "SefBot/1.0",
+    }
+
+    raw = None
+    for attempt in range(2):
+        conn = _mercury_pool.get()
+        try:
+            conn.request("POST", endpoint, body=data, headers=headers)
+            res = conn.getresponse()
+            raw_bytes = res.read()
+            if res.status >= 400:
+                detail = raw_bytes.decode("utf-8", "ignore")[:300]
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                raise RuntimeError(f"mercury {res.status}: {detail}")
+            _mercury_pool.put(conn)
+            raw = raw_bytes.decode("utf-8")
+            break
+        except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError):
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if attempt == 1:
+                raise
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+
+    if not raw:
+        raise RuntimeError("mercury: empty response")
+
+    d = json.loads(raw)
+    if "choices" not in d:
+        raise RuntimeError(f"mercury: {json.dumps(d.get('error', d))[:200]}")
+    text = (d["choices"][0].get("message") or {}).get("content")
+    if not text or not str(text).strip():
+        raise RuntimeError("mercury: empty content")
+    return str(text).strip()
+
+
+def _groq_generate(model, system, messages, max_tokens, temperature) -> str:
+    """Groq call, rotating across keys (separate orgs = separate quotas)."""
+    if not _clients:
+        raise RuntimeError("no groq api key configured")
+    full = [{"role": "system", "content": system}] + messages if system else list(messages)
+    n = len(_clients)
+    start = _next_index()
+    last = None
+    for attempt in range(n):
+        try:
+            resp = _clients[(start + attempt) % n].chat.completions.create(
+                model=model, max_tokens=max_tokens,
+                temperature=temperature, messages=full,
+            )
+            return (resp.choices[0].message.content or "").strip()
+        except Exception as e:
+            last = e
+            if _is_rate_limited(e):
+                continue
+            raise
+    raise last
+
+
+def _gemini_parts_from_content(c) -> list:
+    """Convert OpenAI-style content (str or multimodal parts) to Gemini parts."""
+    if not isinstance(c, list):
+        return [{"text": str(c)}]
+    parts = []
+    for p in c:
+        if not isinstance(p, dict):
+            continue
+        if p.get("type") == "text":
+            parts.append({"text": p.get("text", "")})
+        elif p.get("type") == "image_url":
+            url = (p.get("image_url") or {}).get("url") or ""
+            if url.startswith("data:") and ";base64," in url:
+                header, b64 = url.split(";base64,", 1)
+                mime = header[5:] if header.startswith("data:") else "image/png"
+                parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+            elif url:
+                mime = "image/jpeg"
+                if ".png" in url.lower():
+                    mime = "image/png"
+                elif ".webp" in url.lower():
+                    mime = "image/webp"
+                parts.append({"file_data": {"mime_type": mime, "file_uri": url}})
+    return parts or [{"text": ""}]
+
+
+def _gemini_generate(model, system, messages, max_tokens, temperature) -> str:
+    """Google Gemini call (different API shape: system is separate, roles differ)."""
+    import urllib.error
+    import urllib.request
+
+    if not config.GEMINI_KEYS:
+        raise RuntimeError("no gemini api key configured")
+
+    contents = []
+    for m in messages:
+        contents.append({
+            "role": "model" if m.get("role") == "assistant" else "user",
+            "parts": _gemini_parts_from_content(m.get("content")),
+        })
+
+    _gemini_off = [
+        {"category": cat, "threshold": "BLOCK_NONE"}
+        for cat in (
+            "HARM_CATEGORY_HARASSMENT",
+            "HARM_CATEGORY_HATE_SPEECH",
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            "HARM_CATEGORY_DANGEROUS_CONTENT",
+            "HARM_CATEGORY_CIVIC_INTEGRITY",
+        )
+    ]
+    body = {
+        "contents": contents,
+        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": temperature},
+        "safetySettings": _gemini_off,
+    }
+    if system:
+        body["systemInstruction"] = {"parts": [{"text": system}]}
+    data = json.dumps(body).encode()
+
+    last = None
+    for key in config.GEMINI_KEYS:
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{model}:generateContent?key={key}")
+        try:
+            req = urllib.request.Request(
+                url, data=data, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                d = json.loads(r.read())
+            for cand in d.get("candidates") or []:
+                parts = cand.get("content", {}).get("parts", []) or []
+                text = "".join(p.get("text", "") for p in parts).strip()
+                if text:
+                    return text
+            return ""
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode()[:200]
+            except Exception:
+                pass
+            last = RuntimeError(f"gemini {e.code}: {detail}")
+            if e.code in (429, 500, 502, 503):
+                continue
+            raise last
+        except Exception as e:
+            last = e
+            continue
+    raise last
+
+
+def _is_cerebras(model: str) -> bool:
+    return str(model).startswith("cb:")
+
+
+def _cerebras_generate(model, system, messages, max_tokens, temperature) -> str:
+    """Cerebras (OpenAI-compatible, very fast).
+
+    Two quirks worth keeping: a User-Agent header is REQUIRED (Cloudflare
+    rejects urllib's default with a misleading `error code 1010` that looks
+    like a bad key), and reasoning-style models can return a message with a
+    `reasoning` field but no `content` — which must raise, not return empty.
+    """
+    import urllib.error
+    import urllib.request
+
+    if not config.CEREBRAS_API_KEY:
+        raise RuntimeError("no cerebras api key configured")
+
+    full = ([{"role": "system", "content": system}] if system else []) + [
+        {"role": m.get("role", "user"),
+         "content": (" ".join(p.get("text", "") for p in m["content"]
+                              if isinstance(p, dict) and p.get("type") == "text")
+                     if isinstance(m.get("content"), list) else str(m.get("content")))}
+        for m in messages
+    ]
+    body = json.dumps({
+        "model": model[3:],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": full,
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.cerebras.ai/v1/chat/completions", data=body,
+        headers={
+            "Authorization": f"Bearer {config.CEREBRAS_API_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": "sefbot/1.0",
+        },
+    )
+    try:
+        d = json.loads(urllib.request.urlopen(req, timeout=20).read())
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode()[:200]
+        except Exception:
+            pass
+        raise RuntimeError(f"cerebras {e.code}: {detail}")
+
+    if "choices" not in d:
+        raise RuntimeError(f"cerebras: {json.dumps(d)[:200]}")
+    text = (d["choices"][0].get("message") or {}).get("content")
+    if not text or not str(text).strip():
+        raise RuntimeError("cerebras: empty content")
+    return str(text).strip()
+
+
+def _is_openrouter(model: str) -> bool:
+    return str(model).startswith("or:")
+
+
+def _openrouter_key(model: str) -> str:
+    """OpenRouter key for a model. DeepSeek models use their own key
+    (DEEPSEEK_API_KEY) so !ask / assistant don't eat the main OpenRouter quota."""
+    if "deepseek/" in str(model).lower():
+        return config.DEEPSEEK_API_KEY or config.OPENROUTER_API_KEY
+    return config.OPENROUTER_API_KEY
+
+
+def _openrouter_content(c):
+    """Keep multimodal content parts intact (vision). Flatten only if needed."""
+    if isinstance(c, list):
+        return c
+    return str(c)
+
+
+def _openrouter_generate(model, system, messages, max_tokens, temperature) -> str:
+    """OpenRouter (free tier), OpenAI-compatible.
+
+    Free models share upstream capacity and fail intermittently. Critically,
+    OpenRouter reports those failures as HTTP 200 with an {"error": ...} body,
+    and some models return content: null — both must raise so the fallback
+    chain moves on instead of returning an empty reply.
+
+    Multimodal (vision) messages are forwarded as-is — do not strip image parts.
+    """
+    import urllib.error
+    import urllib.request
+
+    api_key = _openrouter_key(model)
+    if not api_key:
+        raise RuntimeError("no openrouter api key configured")
+
+    full = ([{"role": "system", "content": system}] if system else []) + [
+        {"role": m.get("role", "user"),
+         "content": _openrouter_content(m.get("content"))}
+        for m in messages
+    ]
+    has_images = any(
+        isinstance(m.get("content"), list)
+        and any(isinstance(p, dict) and p.get("type") == "image_url" for p in m["content"])
+        for m in messages
+    )
+    timeout = 60 if has_images else 25
+    body = json.dumps({
+        "model": model[3:],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": full,
+        "provider": {"require_parameters": False},
+        "route": "fallback",
+    }).encode()
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions", data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "X-Title": "SefBot",
+        },
+    )
+    try:
+        d = json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode()[:200]
+        except Exception:
+            pass
+        raise RuntimeError(f"openrouter {e.code}: {detail}")
+
+    if "choices" not in d:
+        raise RuntimeError(f"openrouter: {json.dumps(d.get('error', d))[:200]}")
+    text = (d["choices"][0].get("message") or {}).get("content")
+    if not text or not str(text).strip():
+        raise RuntimeError("openrouter: empty content")
+    return str(text).strip()
+
+
+def _is_deepseek(model: str) -> bool:
+    return str(model).strip().lower().startswith("deepseek")
+
+
+def _deepseek_generate(model, system, messages, max_tokens, temperature) -> str:
+    """DeepSeek (OpenAI-compatible). Used by !ask and the assistant command."""
+    import urllib.error
+    import urllib.request
+
+    if not config.DEEPSEEK_API_KEY:
+        raise RuntimeError("no deepseek api key configured")
+
+    full = ([{"role": "system", "content": system}] if system else []) + [
+        {"role": m.get("role", "user"),
+         "content": (" ".join(p.get("text", "") for p in m["content"]
+                              if isinstance(p, dict) and p.get("type") == "text")
+                     if isinstance(m.get("content"), list) else str(m.get("content")))}
+        for m in messages
+    ]
+    body = json.dumps({
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": full,
+    }).encode()
+    req = urllib.request.Request(
+        config.DEEPSEEK_BASE_URL + "/chat/completions", data=body,
+        headers={
+            "Authorization": f"Bearer {config.DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": "sefbot/1.0",
+        },
+    )
+    try:
+        d = json.loads(urllib.request.urlopen(req, timeout=30).read())
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode()[:200]
+        except Exception:
+            pass
+        raise RuntimeError(f"deepseek {e.code}: {detail}")
+
+    if "choices" not in d:
+        raise RuntimeError(f"deepseek: {json.dumps(d)[:200]}")
+    text = (d["choices"][0].get("message") or {}).get("content")
+    if not text or not str(text).strip():
+        raise RuntimeError("deepseek: empty content")
+    return str(text).strip()
+
+
+def _is_inferx(model: str) -> bool:
+    return str(model).strip().lower().startswith("ix:")
+
+
+def _inferx_generate(model, system, messages, max_tokens, temperature) -> str:
+    """InferX (OpenAI-compatible). Serves the deepseek model for !ask/assistant."""
+    import urllib.error
+    import urllib.request
+
+    if not config.INFERX_API_KEY:
+        raise RuntimeError("no inferx api key configured")
+
+    full = ([{"role": "system", "content": system}] if system else []) + [
+        {"role": m.get("role", "user"),
+         "content": (" ".join(p.get("text", "") for p in m["content"]
+                              if isinstance(p, dict) and p.get("type") == "text")
+                     if isinstance(m.get("content"), list) else str(m.get("content")))}
+        for m in messages
+    ]
+    body = json.dumps({
+        "model": model[3:],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": full,
+    }).encode()
+    req = urllib.request.Request(
+        config.INFERX_BASE_URL + "/chat/completions", data=body,
+        headers={
+            "Authorization": f"Bearer {config.INFERX_API_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": "sefbot/1.0",
+        },
+    )
+    try:
+        d = json.loads(urllib.request.urlopen(req, timeout=30).read())
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode()[:200]
+        except Exception:
+            pass
+        raise RuntimeError(f"inferx {e.code}: {detail}")
+
+    if "choices" not in d:
+        raise RuntimeError(f"inferx: {json.dumps(d)[:200]}")
+    text = (d["choices"][0].get("message") or {}).get("content")
+    if not text or not str(text).strip():
+        raise RuntimeError("inferx: empty content")
+    return str(text).strip()
+
+
+def deepseek_configured() -> bool:
+    """True if the configured DEEPSEEK_MODEL can actually run (its key is set)."""
+    model = config.DEEPSEEK_MODEL or ""
+    if _is_inferx(model):
+        return bool(config.INFERX_API_KEY)
+    if _is_openrouter(model):
+        return bool(_openrouter_key(model))
+    return bool(config.DEEPSEEK_API_KEY)
+
+
+def _is_anthropic(model: str) -> bool:
+    return str(model).startswith("claude")
+
+
+_anthropic_client = None
+
+
+def _anthropic_generate(model, system, messages, max_tokens, temperature) -> str:
+    """Anthropic call (paid — expert tier only). Uses the official SDK.
+
+    Note: Opus 4.8 rejects `temperature`/`top_p`/`top_k` with a 400, so the
+    temperature argument is deliberately ignored here. Adaptive thinking is on
+    because this path exists for correctness-sensitive teaching answers.
+    """
+    global _anthropic_client
+    if not config.ANTHROPIC_API_KEY:
+        raise RuntimeError("no anthropic api key configured")
+    if _anthropic_client is None:
+        import anthropic
+        _anthropic_client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+
+    msgs = []
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, list):
+            c = " ".join(p.get("text", "") for p in c
+                         if isinstance(p, dict) and p.get("type") == "text")
+        msgs.append({
+            "role": "assistant" if m.get("role") == "assistant" else "user",
+            "content": str(c),
+        })
+
+    resp = _anthropic_client.messages.create(
+        model=model,
+        max_tokens=max(int(max_tokens), 4000),
+        system=system,
+        thinking={"type": "adaptive"},
+        messages=msgs,
+    )
+    if getattr(resp, "stop_reason", None) == "refusal":
+        raise RuntimeError("anthropic refusal")
+    return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+
+def _generate(requested, system, messages, max_tokens, temperature,
+              fallbacks=None) -> str:
+    """Run the request down a fallback chain.
+
+    Quotas are per (provider, org, model), so when one is exhausted a different
+    model — or an entirely different provider — still has its own budget.
+
+    `fallbacks` lets a caller pick a different chain: the expert tier passes an
+    intelligence-ordered one so !cybersec degrades to the smartest remaining
+    model rather than the fastest.
+    """
+    pool = config.MODEL_FALLBACKS if fallbacks is None else fallbacks
+    chain = [requested] + [m for m in pool if m != requested]
+    last = None
+    for i, model in enumerate(chain):
+        if _is_mercury(model) and not config.INCEPTION_API_KEY:
+            continue
+        if _is_celeris(model) and not config.CELERIS_API_KEY:
+            continue
+        if _is_gemini(model) and not config.GEMINI_KEYS:
+            continue
+        if _is_anthropic(model) and not config.ANTHROPIC_API_KEY:
+            continue
+        if _is_openrouter(model) and not _openrouter_key(model):
+            continue
+        if _is_cerebras(model) and not config.CEREBRAS_API_KEY:
+            continue
+        if _is_deepseek(model) and not config.DEEPSEEK_API_KEY:
+            continue
+        if _is_inferx(model) and not config.INFERX_API_KEY:
+            continue
+        if (
+            not _is_mercury(model)
+            and not _is_celeris(model)
+            and not _is_gemini(model)
+            and not _is_anthropic(model)
+            and not _is_openrouter(model)
+            and not _is_cerebras(model)
+            and not _is_deepseek(model)
+            and not _is_inferx(model)
+            and not _clients
+        ):
+            continue
+        try:
+            if _is_mercury(model):
+                fn = _mercury_generate
+            elif _is_celeris(model):
+                fn = _celeris_generate
+            elif _is_anthropic(model):
+                fn = _anthropic_generate
+            elif _is_cerebras(model):
+                fn = _cerebras_generate
+            elif _is_openrouter(model):
+                fn = _openrouter_generate
+            elif _is_inferx(model):
+                fn = _inferx_generate
+            elif _is_deepseek(model):
+                fn = _deepseek_generate
+            elif _is_gemini(model):
+                fn = _gemini_generate
+            else:
+                fn = _groq_generate
+            out = fn(model, system, messages, max_tokens, temperature)
+            if i:
+                print(f"[failover] {requested} exhausted -> served by {model}")
+            return out
+        except Exception as e:
+            last = e
+            if i == len(chain) - 1:
+                raise
+            continue
+    if last:
+        raise last
+    raise RuntimeError("no model available")
+
+
+def friendly_error(e: Exception) -> str:
+    """Turn an API error into something a human wants to read."""
+    s = str(e)
+    if _is_rate_limited(e):
+        import re as _re
+        m = _re.search(r"try again in ([0-9hms.]+)", s, _re.I)
+        wait = f" try again in {m.group(1)}." if m else " give it a few minutes."
+        return f"i'm out of tokens for now -{wait}"
+    if "credit balance is too low" in s.lower():
+        return "the paid model's out of credit. add credits at console.anthropic.com/settings/billing"
+    if "401" in s or "invalid api key" in s.lower():
+        return "my api key got rejected. someone check the AI keys (Mercury/Celeris/Groq)."
+    if "mercury" in s.lower() and ("402" in s or "credit" in s.lower() or "quota" in s.lower()):
+        return "mercury is out of quota/credits — check inception platform billing."
+    if "celeris" in s.lower() and ("401" in s or "invalid" in s.lower()):
+        return "celeris key rejected — regenerate at console.celeris.ai"
+    if "deepseek" in s.lower() and ("401" in s or "invalid" in s.lower()):
+        return "deepseek key rejected — check DEEPSEEK_API_KEY."
+    return f"my brain hiccuped: {s[:180]}"
+
+
+async def _run(fn):
+    """Run a blocking call on the dedicated pool."""
+    return await asyncio.get_running_loop().run_in_executor(_EXECUTOR, fn)
+
+
+_llm_sem: Optional[asyncio.Semaphore] = None
+
+
+def _llm_semaphore() -> asyncio.Semaphore:
+    global _llm_sem
+    if _llm_sem is None:
+        _llm_sem = asyncio.Semaphore(config.AI_MAX_CONCURRENCY)
+    return _llm_sem
+
+
+def _resolve_model(tier: str) -> str:
+    t = (tier or "smart").lower()
+    if t == "fast":
+        return config.MODEL_FAST
+    if t == "vision":
+        return config.MODEL_VISION
+    if t == "expert":
+        return config.MODEL_EXPERT
+    return config.MODEL_SMART
+
+
+async def chat(
+    system: str,
+    messages: List[dict],
+    max_tokens: int = 600,
+    temperature: float = 0.7,
+    model: Optional[str] = None,
+    tier: str = "smart",
+    fallbacks: Optional[List[str]] = None,
+) -> str:
+    """Run a chat completion and return the text.
+
+    `tier` selects smart/fast/vision when `model` is not set explicitly.
+    Message content may be a string or a list of multimodal content parts.
+    Pass `fallbacks=[]` to disable the default text-model chain (needed for vision).
+    """
+    use_model = model or _resolve_model(tier)
+    if fallbacks is None:
+        fallbacks = config.MODEL_EXPERT_FALLBACKS if tier == "expert" else None
+    if tier == "vision" and fallbacks is None:
+        fallbacks = []
+
+    def _call():
+        return _generate(use_model, system, messages, max_tokens, temperature,
+                         fallbacks=fallbacks)
+
+    async with _llm_semaphore():
+        return await _run(_call)
+
+
+async def structured(
+    system: str,
+    messages: List[dict],
+    max_tokens: int = 1100,
+    temperature: float = 0.8,
+    tier: str = "smart",
+    model: Optional[str] = None,
+    fallbacks: Optional[List[str]] = None,
+) -> Optional[dict]:
+    """Multi-turn chat that must return a single JSON object (the brain's reply)."""
+    raw = await chat(
+        system=system,
+        messages=messages,
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        tier=tier,
+        fallbacks=fallbacks,
+    )
+    return _extract_json(raw)
+
+
+async def json_call(
+    system: str,
+    prompt: str,
+    max_tokens: int = 800,
+    tier: str = "smart",
+) -> Optional[dict]:
+    """Ask the model for a single JSON object and parse it."""
+    system = system + "\n\nRespond with ONLY a single valid JSON object, no prose."
+    raw = await chat(
+        system=system,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_tokens,
+        temperature=0.3,
+        tier=tier,
+    )
+    return _extract_json(raw)
+
+
+def _fetch_image_as_data_url(url: str, max_bytes: int = 8_000_000) -> Optional[str]:
+    """Download an image and return a data: URL. Many vision APIs choke on
+    Discord CDN / short-lived embed URLs when they try to fetch them themselves;
+    inlining base64 is far more reliable."""
+    import base64
+    import mimetypes
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; SefBot/1.0; +https://discord.com)",
+            "Accept": "image/*,*/*;q=0.8",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = resp.read(max_bytes + 1)
+            if len(data) > max_bytes:
+                return None
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as e:
+        print(f"[vision] download failed for {url[:80]}: {e}")
+        return None
+
+    if not ctype.startswith("image/"):
+        guess, _ = mimetypes.guess_type(url.split("?")[0])
+        ctype = guess if guess and guess.startswith("image/") else "image/png"
+    b64 = base64.b64encode(data).decode("ascii")
+    return f"data:{ctype};base64,{b64}"
+
+
+async def describe_images(image_urls: List[str], caption: str = "") -> str:
+    """Vision pass: short description of attached / embed image URLs.
+
+    Prefers inlined base64 data URLs so Groq (etc.) doesn't have to fetch
+    Discord CDN links themselves — those often 403 from datacenter IPs.
+    """
+    if not image_urls:
+        return ""
+
+    async def _prep(url: str) -> str:
+        data_url = await _run(lambda u=url: _fetch_image_as_data_url(u))
+        return data_url or url
+
+    prepared: List[str] = []
+    for url in image_urls[:4]:
+        try:
+            prepared.append(await _prep(url))
+        except Exception as e:
+            print(f"[vision] prep failed: {e}")
+            prepared.append(url)
+
+    parts: List[dict] = []
+    text = caption.strip() or "Describe what you see in these image(s), briefly and bluntly."
+    parts.append({"type": "text", "text": text})
+    for url in prepared:
+        parts.append({"type": "image_url", "image_url": {"url": url}})
+
+    vision_fallbacks = [config.MODEL_VISION] + list(config.MODEL_VISION_FALLBACKS or [])
+    seen = set()
+    vision_fallbacks = [m for m in vision_fallbacks if m and not (m in seen or seen.add(m))]
+
+    last_err: Exception = RuntimeError("no vision attempt")
+    for i, model in enumerate(vision_fallbacks):
+        try:
+            out = await chat(
+                system=(
+                    "You describe Discord images and link-preview screenshots for another AI. "
+                    "Be concrete and short (2-6 sentences). No emoji. "
+                    "Read and quote any visible text (tweets, headlines, UI labels, memes). "
+                    "If it's a screenshot of a social media post, name the author and summarize the post."
+                ),
+                messages=[{"role": "user", "content": parts}],
+                max_tokens=450,
+                temperature=0.2,
+                model=model,
+                tier="vision",
+                fallbacks=[],
+            )
+            if out and out.strip() and not out.strip().lower().startswith("(vision failed"):
+                if i:
+                    print(f"[vision] served by fallback {model}")
+                return out.strip()
+            last_err = RuntimeError("empty vision response")
+        except Exception as e:
+            last_err = e
+            print(f"[vision] {model} failed: {e}")
+            continue
+    return f"(vision failed: {last_err})"
+
+
+def _ddg_results(query: str, k: int) -> List[dict]:
+    """DuckDuckGo (keyless). Retries across backends since DDG rate-limits bursts."""
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        from duckduckgo_search import DDGS
+    errors = []
+    for backend in ("auto", "lite", "html"):
+        try:
+            with DDGS() as d:
+                try:
+                    r = list(d.text(query, max_results=k, backend=backend))
+                except TypeError:
+                    r = list(d.text(query, max_results=k))
+            if r:
+                return r
+        except Exception as e:
+            errors.append(f"{backend}: {e}")
+    if errors:
+        raise RuntimeError("; ".join(errors))
+    return []
+
+
+def _tavily_results(query: str, k: int) -> List[dict]:
+    """Tavily search API (reliable from cloud IPs). Used when TAVILY_API_KEY is set."""
+    import json as _json
+    import urllib.request
+    body = _json.dumps({
+        "api_key": config.TAVILY_API_KEY, "query": query,
+        "max_results": k, "search_depth": "basic",
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.tavily.com/search", data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        d = _json.loads(resp.read())
+    return [
+        {"title": r.get("title"), "href": r.get("url"), "body": r.get("content", "")}
+        for r in d.get("results", [])
+    ]
+
+
+def _search_backend(query: str, k: int) -> List[dict]:
+    """Prefer Tavily if configured (reliable), else keyless DuckDuckGo."""
+    if config.TAVILY_API_KEY:
+        try:
+            r = _tavily_results(query, k)
+            if r:
+                return r
+        except Exception:
+            pass
+    return _ddg_results(query, k)
+
+
+async def search_context(query: str, k: int = 5):
+    """Raw keyless web search. Returns (context_str, sources, error_or_None).
+
+    context_str is a compact block of the top results for feeding to a model;
+    sources is [{"title","url"}...] taken straight from the engine.
+    """
+    def _fetch():
+        try:
+            return _search_backend(query, k), None
+        except Exception as e:
+            return [], str(e)
+
+    results, err = await _run(_fetch)
+    if err or not results:
+        return "", [], err
+    sources = [
+        {"title": (r.get("title") or r.get("href"))[:200], "url": r.get("href")}
+        for r in results if r.get("href")
+    ][:5]
+    ctx = "\n\n".join(
+        f"[{i}] {r.get('title','')}\n{r.get('href','')}\n{(r.get('body') or '')[:400]}"
+        for i, r in enumerate(results, 1)
+    )
+    return ctx, sources, None
+
+
+async def web_search(query: str, k: int = 5) -> dict:
+    """Keyless web search that returns a self-contained {answer, sources}.
+
+    Used by the explicit /search and !search commands. Sources come straight
+    from the search engine, so their URLs are always real.
+    """
+    ctx, sources, err = await search_context(query, k)
+    if err:
+        return {"answer": f"couldn't reach search right now ({err[:80]}).", "sources": []}
+    if not ctx:
+        return {"answer": "found nothing useful for that.", "sources": []}
+    system = (
+        "You answer the user's question using ONLY the search results provided. "
+        "Be concise and factual (1-4 sentences). No emoji. Do not invent facts or "
+        "URLs. If the results don't actually answer it, say so plainly."
+    )
+    try:
+        answer = await chat(
+            system, [{"role": "user", "content": f"Question: {query}\n\nResults:\n{ctx}\n\nAnswer:"}],
+            max_tokens=350, temperature=0.3, tier="smart",
+        )
+    except Exception as e:
+        answer = f"found results but couldn't summarise them ({str(e)[:60]})."
+    return {"answer": answer, "sources": sources}
+
+
+def _extract_json(text: str) -> Optional[dict]:
+    text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+    return None

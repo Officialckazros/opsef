@@ -1,0 +1,12 @@
+name = "sefbot-path"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+account_id = "114651c9288b7d9012b396fe66737d16"
+
+routes = [
+  { pattern = "kozzyx.org/sefbot*", zone_name = "kozzyx.org" },
+  { pattern = "www.kozzyx.org/sefbot*", zone_name = "kozzyx.org" },
+]
+
+[vars]
+SEFBOT_ORIGIN = "https://sefbot-production.up.railway.app"

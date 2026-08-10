@@ -1,0 +1,139 @@
+==============================================================================
+ SefBot — COMPLETE COMMAND REFERENCE
+ Default prefix: !   (change with SEFBOT_PREFIX)
+==============================================================================
+
+------------------------------------------------------------------------------
+ TALKING TO IT (no prefix)
+------------------------------------------------------------------------------
+@SefBot <message>        Chat with it in a server (mention it).
+<message>  (in a DM)     Chat with it in a direct message.
+Attach image + mention   Vision model describes the image; brain uses it.
+React 👍 / 👎 on a reply  Feedback — learns + adjusts bond with you.
+Reply to a reply         Correction; stored and reflected into lessons.
+
+Notes:
+- Remembers facts about YOU (merged/deduped, importance-ranked).
+- Short-term conversation history with each person.
+- Per-user relationship score, private nickname, grudge.
+- Reads recent channel messages for context.
+- Every reply is an embed. Never uses emoji in its text.
+- One model for everything: DeepSeek V4 Flash via InferX (image vision uses a
+  separate free multimodal model).
+
+------------------------------------------------------------------------------
+ BUILT-IN COMMANDS
+------------------------------------------------------------------------------
+!help                    Full command map.
+
+!teach <fact>            Teach a SERVER fact.
+!teach @user <fact>      Teach a fact ABOUT that user.
+
+!memories [@user]        List memories (with importance).
+!about                   Alias of !memories.
+!memory                  List memories.
+!memory erase [@user]    Wipe ALL memories about you/someone.
+!memory edit <id> <text> Edit a memory by id.
+!memory compact [@user]  Keep top memories, drop the rest.
+!forget <id>             Delete one memory by id.
+
+!bond [@user]            Relationship score, nickname, grudge.
+!relationship            Alias of !bond.
+!rivalries               Worst bonds + favorites on this server.
+!resetconvo              Clear short-term chat history with you.
+
+!mood                    Current server mood.
+!vibecheck               Brutal read on recent channel energy.
+!recap [day|week]        Savage recap of recent chat (smart model).
+!persona                 Show guild persona controls.
+!persona set <text>      Override persona for this server (manage server).
+!persona clear           Reset to default persona.
+!persona show            Dump full persona text.
+
+!quote add <text>        Save a hall-of-shame line (@user tags them).
+!quote / !quote random   Random quote.
+!quote list              Recent quotes.
+!quote del <id>          Delete a quote.
+!quotes                  Alias of !quote.
+
+!ship @a @b              Ship percentage + verdict.
+!8ball <question>        Magic 8-ball (unhinged).
+!roastbattle @user       AI roast battle using known dirt.
+!trivia                  Trivia from stored memories (answer reveals).
+!whoami                  Who you are to the bot (memories + bond).
+
+!request <idea>          Invent a community command (smart model designs).
+!commands                List community commands.
+!delcmd <name>           Delete a community command.
+
+!stats / !level          Growth + your personal bond.
+!lessons                 Lessons learned from feedback.
+!reflect                 Force a learning pass now.
+
+!ask <question>          Ask the DeepSeek V4 Flash model directly (no persona).
+!assistant <request>     ONE-SHOT helpful mode (runs on DeepSeek V4 Flash).
+!assist <request>        Alias of !assistant.
+
+Normal @mentions / DMs stay full chaotic SefBot. Only the !assistant command
+drops the savage tone and answers as a clear, compliant helper for THAT reply
+(roles, timeouts, nicknames, channels, factual answers, etc.). There is no
+sticky on/off — the next @mention is chaotic again. Discord still enforces that
+YOU hold the matching permission for actions.
+
+!music <song name>       Search YouTube, download, and send the MP3 directly.
+!song / !mp3             Aliases of !music.
+                         (also: slash `/music song:<name>`)
+
+!privacy / !tos          Link to Terms & Privacy + data control commands.
+!dmblock                 Opt out of bot-relayed DMs from other users.
+!dmunblock               Re-enable bot-relayed DMs.
+!mydm                    Show DM opt-out status.
+
+!nuke <n> / !purge <n>   Delete the last n messages in this channel (1–100).
+                         Needs Manage Messages (you + bot). Includes the command.
+!lurk on|off             Proactive quiet-channel quips (manage server).
+!config [show]           Guild settings + model info.
+!config swear full|medium|clean
+!config channels here|clear
+
+!export                  Export guild brain JSON (manage server).
+!import                  Import from attachment or pasted JSON (manage server).
+
+------------------------------------------------------------------------------
+ COMMUNITY COMMANDS
+------------------------------------------------------------------------------
+!<name> <input>          Run any !request-created command (fast model).
+
+------------------------------------------------------------------------------
+ AI ACTIONS (ask in chat — permission gated)
+------------------------------------------------------------------------------
+  kick_user / ban_user / assign_role / remove_role / dm_user /
+  list_roles / set_status / chart / react_message
+
+Only runs if YOU hold the matching Discord permission
+(except react_message — anyone; bot can also react spontaneously).
+
+------------------------------------------------------------------------------
+ OWNER TERMINAL (global shell — not Discord)
+------------------------------------------------------------------------------
+block access <user_id>   Hard-block a user from ALL bot interaction
+                         (mentions, DMs, prefix cmds, slash, reactions).
+                         Takes effect immediately; no restart.
+block unblock <user_id>  Remove a live CLI block.
+block list               Show live-blocked user ids.
+
+tos break                List EVERY ToS auto-block + why, then pick who to
+                         unblock. Unblocked users get a bot DM that they can
+                         use the bot again.
+tos break list           List ToS blocks only (no prompt).
+tos break unblock <id>   Unblock one user + DM them access restored.
+tos break unblock all    Unblock all ToS blocks (confirm) + DM each.
+                         Pass --no-dm to skip the notify.
+
+(Also: `python3 block_cli.py access <user_id>` / `python3 tos_cli.py break`
+ from the project dir.)
+
+==============================================================================
+ Growth axes: memories · lessons · commands · quotes · relationships · level
+ Model: DeepSeek V4 Flash via InferX (default everywhere); vision = free multimodal
+==============================================================================
