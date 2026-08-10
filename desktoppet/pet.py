@@ -31,6 +31,7 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QGuiApplication,
+    QIcon,
     QImage,
     QPainter,
     QPainterPath,
@@ -56,7 +57,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "SefPet"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 CONFIG_DIR = Path.home() / ".sefpet"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 SPRITE_NAMES = ["desktoppet.png", "desktoppet.jpg", "desktoppet.jpeg", "pet.png", "pet.jpg"]
@@ -1062,27 +1063,30 @@ def main():
     pet = PetWindow(settings, mood, env)
     pet.show()
 
-    # system tray (optional)
+    # system tray (optional) — never let a tray failure kill the pet
     tray = None
-    if QSystemTrayIcon.isSystemTrayAvailable():
-        tray = QSystemTrayIcon(QIcon(pet.sprite), app)
-        tray.setToolTip(APP_NAME)
-        tm = QMenu()
-        show_a = QAction("Show / hide", tm)
-        show_a.triggered.connect(lambda: pet.show() if pet.isHidden() else pet.hide())
-        feed_a = QAction("Feed", tm)
-        feed_a.triggered.connect(pet._feed)
-        quit_a = QAction("Quit", tm)
-        quit_a.triggered.connect(pet._quit)
-        tm.addAction(show_a)
-        tm.addAction(feed_a)
-        tm.addSeparator()
-        tm.addAction(quit_a)
-        tray.setContextMenu(tm)
-        tray.activated.connect(
-            lambda reason: pet.show() if reason == QSystemTrayIcon.Trigger else None
-        )
-        tray.show()
+    try:
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            tray = QSystemTrayIcon(QIcon(pet.sprite), app)
+            tray.setToolTip(APP_NAME)
+            tm = QMenu()
+            show_a = QAction("Show / hide", tm)
+            show_a.triggered.connect(lambda: pet.show() if pet.isHidden() else pet.hide())
+            feed_a = QAction("Feed", tm)
+            feed_a.triggered.connect(pet._feed)
+            quit_a = QAction("Quit", tm)
+            quit_a.triggered.connect(pet._quit)
+            tm.addAction(show_a)
+            tm.addAction(feed_a)
+            tm.addSeparator()
+            tm.addAction(quit_a)
+            tray.setContextMenu(tm)
+            tray.activated.connect(
+                lambda reason: pet.show() if reason == QSystemTrayIcon.Trigger else None
+            )
+            tray.show()
+    except Exception:
+        tray = None  # tray is optional; keep the pet alive
 
     return app.exec()
 
