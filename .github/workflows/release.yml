@@ -1,0 +1,43 @@
+name: Release SefPet
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: SefPet-Windows.exe
+            command: python -m PyInstaller --noconfirm --clean --onefile --windowed --name SefPet --add-data "desktoppet.jpg;." pet.py && Copy-Item dist\SefPet.exe SefPet-Windows.exe
+          - os: macos-latest
+            artifact: SefPet-macOS.zip
+            command: python -m PyInstaller --noconfirm --clean --windowed --name SefPet --add-data "desktoppet.jpg:." pet.py && cd dist && zip -r SefPet-macOS.zip SefPet.app && cd .. && cp dist/SefPet-macOS.zip SefPet-macOS.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install PySide6 pyinstaller groq
+
+      - name: Build
+        working-directory: desktoppet
+        shell: ${{ matrix.os == 'windows-latest' && 'pwsh' || 'bash' }}
+        run: ${{ matrix.command }}
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: desktoppet/${{ matrix.artifact }}
+          generate_release_notes: true

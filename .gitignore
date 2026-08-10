@@ -10,3 +10,6 @@ cli_active_chats.json
 blocked_users.json
 blocked_users.json.tmp
 .wrangler/
+build/
+dist/
+*.spec

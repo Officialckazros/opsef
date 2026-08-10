@@ -311,6 +311,32 @@ FILES
     SEFBOT_MODEL_VISION if needed.
   - DB migrates in place (new tables/columns added on startup).
 
+
+------------------------------------------------------------------------------
+ DESKTOP PET (SefPet) — NEW
+------------------------------------------------------------------------------
+NEW
+  - `desktoppet/` — a standalone desktop pet app (PySide6/Qt).
+  - Lives on the desktop: frameless, transparent, always-on-top window.
+  - Wanders along the bottom of the screen, flips to face direction, drag
+    anywhere with the mouse.
+  - Speech bubbles with typewriter effect + real text-to-speech
+    (macOS `say`, Windows SAPI, Linux espeak — no extra deps).
+  - Ask it questions: AI brain via any OpenAI-compatible endpoint
+    (SEFPET_AI_KEY/BASE_URL/MODEL, falls back to GROQ_API_KEY etc.), plus a
+    built-in offline brain (jokes, facts, math, time, games, chat).
+  - Mood system: hunger / happiness / energy decay over time, idle chatter.
+  - Interactions: click (boop), double-click (headpat), right-click menu
+    (feed, pet, play, ask, jokes, facts, time, dice, sing, sleep, settings).
+  - Settings persisted to ~/.sefpet/config.json; system tray; custom sprite.
+  - Packaged with PyInstaller for Windows (exe) and macOS (app).
+  - `.github/workflows/release.yml` builds + attaches release assets on tag push.
+
+FILES
+  desktoppet/pet.py, desktoppet/README.md, desktoppet/requirements.txt,
+  desktoppet/build_mac.sh, desktoppet/build_windows.ps1,
+  .github/workflows/release.yml
+
 ==============================================================================
  end of CHANGES.txt
 ==============================================================================
