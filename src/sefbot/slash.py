@@ -1636,4 +1636,47 @@ def setup(client: discord.Client, track: Callable) -> app_commands.CommandTree:
         )
         await interaction.response.send_message(embed=embeds.say(body, title="SefBot"))
 
+    @tree.command(name="userinfo", description="View message and activity intelligence for a user.")
+    @app_commands.describe(user="User to inspect (optional)")
+    @anywhere
+    async def userinfo_cmd(interaction: discord.Interaction, user: Optional[discord.User] = None):
+        target_user = user or interaction.user
+        uid = str(target_user.id)
+        gid = _guild_id(interaction)
+        intel = db.get_user_intelligence(uid, gid)
+        rel = db.relationship_get(uid, gid)
+        facts = db.memories_about(uid, gid)
+
+        body = (
+            f"**User Intelligence Report** for **{intel['display_name']}** (@{intel['username']}, ID `{intel['user_id']}`)\n\n"
+            f"- **Total Recorded Messages**: {intel['total_messages']}\n"
+            f"- **Flagged Bad/Offensive Messages**: {intel['bad_message_count']}\n"
+            f"- **Bond Score**: {rel['score']:+.2f} ({rel['bond_label']})\n"
+            f"- **Stored Facts**: {len(facts)}\n"
+        )
+        if intel["bad_messages"]:
+            body += "\n**Recent Flagged Bad Messages:**\n"
+            for bm in intel["bad_messages"][:5]:
+                body += f"• `#{bm['channel_name']}`: \"{bm['content'][:100]}\" *(flags: {bm['bad_words_found']})*\n"
+
+        await interaction.response.send_message(embed=embeds.ok(body, title="user intelligence"))
+
+    @tree.command(name="badmessages", description="View flagged bad or offensive messages for a user.")
+    @app_commands.describe(user="User to inspect (optional)")
+    @anywhere
+    async def badmessages_cmd(interaction: discord.Interaction, user: Optional[discord.User] = None):
+        target_user = user or interaction.user
+        uid = str(target_user.id)
+        gid = _guild_id(interaction)
+        bad_msgs = db.get_user_bad_messages(uid, gid, limit=15)
+        uname = _display_name(target_user)
+        if not bad_msgs:
+            await interaction.response.send_message(embed=embeds.ok(f"No flagged bad messages recorded for **{uname}**.", title="bad messages"))
+            return
+
+        lines = [f"**Flagged Bad Messages** for **{uname}** ({len(bad_msgs)} items):\n"]
+        for bm in bad_msgs:
+            lines.append(f"• `#{bm['channel_name']}`: \"{bm['content'][:120]}\" (words: {bm['bad_words_found']})")
+        await interaction.response.send_message(embed=embeds.ok("\n".join(lines)[:1900], title="bad messages"))
+
     return tree

@@ -123,9 +123,27 @@ CREATE TABLE IF NOT EXISTS guild_settings (
     guild_id TEXT PRIMARY KEY,
     data     TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS server_messages (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id       TEXT UNIQUE,
+    guild_id         TEXT NOT NULL,
+    guild_name       TEXT,
+    channel_id       TEXT NOT NULL,
+    channel_name     TEXT,
+    user_id          TEXT NOT NULL,
+    username         TEXT NOT NULL,
+    display_name     TEXT,
+    content          TEXT NOT NULL,
+    has_bad_words    INTEGER DEFAULT 0,
+    bad_words_found  TEXT,
+    created          REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(subject, guild_id);
 CREATE INDEX IF NOT EXISTS idx_convo_user ON conversations(user_id, guild_id, created);
 CREATE INDEX IF NOT EXISTS idx_quotes_guild ON quotes(guild_id);
+CREATE INDEX IF NOT EXISTS idx_msg_guild_user ON server_messages(guild_id, user_id, created);
+CREATE INDEX IF NOT EXISTS idx_msg_user ON server_messages(user_id, created);
+CREATE INDEX IF NOT EXISTS idx_msg_bad ON server_messages(guild_id, has_bad_words);
 """
 
 _WORD = re.compile(r"[a-z0-9]{3,}")
@@ -171,9 +189,27 @@ def _migrate(c: sqlite3.Connection) -> None:
         guild_id TEXT PRIMARY KEY,
         data     TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS server_messages (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_id       TEXT UNIQUE,
+        guild_id         TEXT NOT NULL,
+        guild_name       TEXT,
+        channel_id       TEXT NOT NULL,
+        channel_name     TEXT,
+        user_id          TEXT NOT NULL,
+        username         TEXT NOT NULL,
+        display_name     TEXT,
+        content          TEXT NOT NULL,
+        has_bad_words    INTEGER DEFAULT 0,
+        bad_words_found  TEXT,
+        created          REAL NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(subject, guild_id);
     CREATE INDEX IF NOT EXISTS idx_convo_user ON conversations(user_id, guild_id, created);
     CREATE INDEX IF NOT EXISTS idx_quotes_guild ON quotes(guild_id);
+    CREATE INDEX IF NOT EXISTS idx_msg_guild_user ON server_messages(guild_id, user_id, created);
+    CREATE INDEX IF NOT EXISTS idx_msg_user ON server_messages(user_id, created);
+    CREATE INDEX IF NOT EXISTS idx_msg_bad ON server_messages(guild_id, has_bad_words);
     """)
     c.execute("DROP TABLE IF EXISTS user_geo")
     c.execute("DROP TABLE IF EXISTS geo_tokens")
@@ -807,3 +843,166 @@ def user_flag_int(user_id: str, key: str, default: int = 0) -> int:
         return int(float(raw))
     except (TypeError, ValueError):
         return default
+
+
+_BAD_PATTERNS = [
+    r"\bfuck\w*", r"\bshit\w*", r"\bbitch\w*", r"\basshole\w*", r"\bbastard\w*",
+    r"\bdick\w*", r"\bpussy\w*", r"\bcunt\w*", r"\bwhore\w*", r"\bslut\w*",
+    r"\bnigger\w*", r"\bnigga\w*", r"\bfaggot\w*", r"\bretard\w*", r"\bkys\b",
+    r"\bkill\s+your\s*self\b", r"\bstfu\b", r"\bshut\s+the\s+fuck\s+up\b",
+    r"\bdumbass\w*", r"\bmotherfucker\w*", r"\bpiece\s+of\s+shit\b"
+]
+_BAD_RE = re.compile("|".join(_BAD_PATTERNS), re.IGNORECASE)
+
+
+def detect_bad_words(content: str) -> tuple:
+    if not content:
+        return False, []
+    matches = list(set(_BAD_RE.findall(content.lower())))
+    return bool(matches), matches
+
+
+def record_server_message(
+    message_id: str,
+    guild_id: str,
+    guild_name: str,
+    channel_id: str,
+    channel_name: str,
+    user_id: str,
+    username: str,
+    display_name: str,
+    content: str,
+) -> None:
+    if not content or not user_id:
+        return
+    has_bad, matches = detect_bad_words(content)
+    bad_str = json.dumps(matches) if has_bad else ""
+    c = conn()
+    c.execute(
+        """
+        INSERT INTO server_messages (
+            message_id, guild_id, guild_name, channel_id, channel_name,
+            user_id, username, display_name, content, has_bad_words,
+            bad_words_found, created
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(message_id) DO UPDATE SET
+            content=excluded.content,
+            display_name=excluded.display_name,
+            has_bad_words=excluded.has_bad_words,
+            bad_words_found=excluded.bad_words_found
+        """,
+        (
+            str(message_id), str(guild_id), str(guild_name or "DM/Unknown"),
+            str(channel_id), str(channel_name or "unknown"), str(user_id),
+            str(username), str(display_name or username), str(content)[:2000],
+            1 if has_bad else 0, bad_str, now()
+        )
+    )
+    c.commit()
+
+
+def get_user_intelligence(user_id: str, guild_id: Optional[str] = None) -> dict:
+    c = conn()
+    uid = str(user_id)
+    gid = str(guild_id) if guild_id and guild_id != "dm" else None
+
+    if gid:
+        total_row = c.execute("SELECT COUNT(*) n FROM server_messages WHERE user_id=? AND guild_id=?", (uid, gid)).fetchone()
+        bad_row = c.execute("SELECT COUNT(*) n FROM server_messages WHERE user_id=? AND guild_id=? AND has_bad_words=1", (uid, gid)).fetchone()
+        timestamps = c.execute("SELECT MIN(created) min_ts, MAX(created) max_ts FROM server_messages WHERE user_id=? AND guild_id=?", (uid, gid)).fetchone()
+        bad_msgs = c.execute("SELECT channel_name, content, bad_words_found, created FROM server_messages WHERE user_id=? AND guild_id=? AND has_bad_words=1 ORDER BY created DESC LIMIT 15", (uid, gid)).fetchall()
+        recent_msgs = c.execute("SELECT channel_name, content, created FROM server_messages WHERE user_id=? AND guild_id=? ORDER BY created DESC LIMIT 15", (uid, gid)).fetchall()
+    else:
+        total_row = c.execute("SELECT COUNT(*) n FROM server_messages WHERE user_id=?", (uid,)).fetchone()
+        bad_row = c.execute("SELECT COUNT(*) n FROM server_messages WHERE user_id=? AND has_bad_words=1", (uid,)).fetchone()
+        timestamps = c.execute("SELECT MIN(created) min_ts, MAX(created) max_ts FROM server_messages WHERE user_id=?", (uid,)).fetchone()
+        bad_msgs = c.execute("SELECT channel_name, content, bad_words_found, created FROM server_messages WHERE user_id=? AND has_bad_words=1 ORDER BY created DESC LIMIT 15", (uid,)).fetchall()
+        recent_msgs = c.execute("SELECT channel_name, content, created FROM server_messages WHERE user_id=?", (uid,)).fetchall()
+
+    user_info = c.execute("SELECT username, display_name FROM server_messages WHERE user_id=? ORDER BY created DESC LIMIT 1", (uid,)).fetchone()
+
+    return {
+        "user_id": uid,
+        "username": user_info["username"] if user_info else uid,
+        "display_name": user_info["display_name"] if user_info else uid,
+        "total_messages": total_row["n"] if total_row else 0,
+        "bad_message_count": bad_row["n"] if bad_row else 0,
+        "first_seen": timestamps["min_ts"] if timestamps else None,
+        "last_seen": timestamps["max_ts"] if timestamps else None,
+        "bad_messages": [dict(r) for r in bad_msgs],
+        "recent_messages": [dict(r) for r in recent_msgs],
+    }
+
+
+def get_user_bad_messages(user_id: str, guild_id: Optional[str] = None, limit: int = 20) -> List[dict]:
+    c = conn()
+    uid = str(user_id)
+    gid = str(guild_id) if guild_id and guild_id != "dm" else None
+    if gid:
+        rows = c.execute(
+            "SELECT channel_name, content, bad_words_found, created FROM server_messages "
+            "WHERE user_id=? AND guild_id=? AND has_bad_words=1 ORDER BY created DESC LIMIT ?",
+            (uid, gid, limit)
+        ).fetchall()
+    else:
+        rows = c.execute(
+            "SELECT channel_name, content, bad_words_found, created FROM server_messages "
+            "WHERE user_id=? AND has_bad_words=1 ORDER BY created DESC LIMIT ?",
+            (uid, limit)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_server_intelligence(guild_id: str) -> dict:
+    c = conn()
+    gid = str(guild_id)
+    total = c.execute("SELECT COUNT(*) n FROM server_messages WHERE guild_id=?", (gid,)).fetchone()["n"]
+    bad_total = c.execute("SELECT COUNT(*) n FROM server_messages WHERE guild_id=? AND has_bad_words=1", (gid,)).fetchone()["n"]
+    top_senders = c.execute(
+        "SELECT user_id, username, display_name, COUNT(*) cnt, "
+        "SUM(has_bad_words) bad_cnt FROM server_messages WHERE guild_id=? "
+        "GROUP BY user_id ORDER BY cnt DESC LIMIT 10", (gid,)
+    ).fetchall()
+    recent_bad = c.execute(
+        "SELECT username, display_name, channel_name, content, bad_words_found, created "
+        "FROM server_messages WHERE guild_id=? AND has_bad_words=1 ORDER BY created DESC LIMIT 10", (gid,)
+    ).fetchall()
+    return {
+        "guild_id": gid,
+        "total_messages": total,
+        "bad_messages_total": bad_total,
+        "top_senders": [dict(r) for r in top_senders],
+        "recent_bad_messages": [dict(r) for r in recent_bad],
+    }
+
+
+def find_user_by_name(query: str, guild_id: Optional[str] = None) -> Optional[dict]:
+    """Look up recorded user by username, display_name, or user ID."""
+    if not query:
+        return None
+    c = conn()
+    q = query.strip().lstrip("@")
+    m = _SNOWFLAKE.search(q)
+    if m:
+        uid = m.group(1)
+        row = c.execute("SELECT user_id, username, display_name FROM server_messages WHERE user_id=? LIMIT 1", (uid,)).fetchone()
+        if row:
+            return dict(row)
+        return {"user_id": uid, "username": uid, "display_name": uid}
+
+    gid = str(guild_id) if guild_id and guild_id != "dm" else None
+    if gid:
+        row = c.execute(
+            "SELECT user_id, username, display_name FROM server_messages "
+            "WHERE guild_id=? AND (username LIKE ? OR display_name LIKE ?) ORDER BY created DESC LIMIT 1",
+            (gid, f"%{q}%", f"%{q}%")
+        ).fetchone()
+        if row:
+            return dict(row)
+
+    row = c.execute(
+        "SELECT user_id, username, display_name FROM server_messages "
+        "WHERE username LIKE ? OR display_name LIKE ? ORDER BY created DESC LIMIT 1",
+        (f"%{q}%", f"%{q}%")
+    ).fetchone()
+    return dict(row) if row else None

@@ -552,6 +552,22 @@ async def on_message(message: discord.Message):
     author = str(message.author.id)
     is_dm = message.guild is None
 
+    guild_name = message.guild.name if message.guild else "DM"
+    channel_name = getattr(message.channel, "name", "DM")
+    username = getattr(message.author, "name", author)
+    display_name = getattr(message.author, "display_name", username)
+    db.record_server_message(
+        str(message.id),
+        guild_id,
+        guild_name,
+        str(message.channel.id),
+        channel_name,
+        author,
+        username,
+        display_name,
+        content
+    )
+
     directed = bool(
         content.startswith(config.PREFIX)
         or client.user in message.mentions
@@ -934,6 +950,9 @@ async def _handle_command(message, body, guild_id, author):
         "opsec": _cmd_opsec,
         "gayrate": _cmd_gayrate,
         "eval": _cmd_eval,
+        "userinfo": _cmd_userinfo,
+        "userhistory": _cmd_userinfo,
+        "badmessages": _cmd_badmessages,
     }
     if name in handlers:
         await handlers[name](message, arg, guild_id, author)
@@ -1995,8 +2014,43 @@ async def _cmd_quote(message, arg, guild_id, author):
         ), feedback=False)
         return
     who = f" — <@{q['about']}>" if q.get("about") else ""
-    await _send(message.channel, embeds.say(f"#{q['id']}: {q['text']}{who}", title="quote"),
-                feedback=False)
+async def _cmd_userinfo(message, arg, guild_id, author):
+    """View detailed message and activity intelligence for a user."""
+    target = db.find_user_by_name(arg, guild_id) if arg else None
+    uid = target["user_id"] if target else author
+    intel = db.get_user_intelligence(uid, guild_id)
+    rel = db.relationship_get(uid, guild_id)
+    facts = db.memories_about(uid, guild_id)
+
+    body = (
+        f"**User Intelligence Report** for **{intel['display_name']}** (@{intel['username']}, ID `{intel['user_id']}`)\n\n"
+        f"- **Total Recorded Messages**: {intel['total_messages']}\n"
+        f"- **Flagged Bad/Offensive Messages**: {intel['bad_message_count']}\n"
+        f"- **Bond Score**: {rel['score']:+.2f} ({rel['bond_label']})\n"
+        f"- **Stored Facts**: {len(facts)}\n"
+    )
+    if intel["bad_messages"]:
+        body += "\n**Recent Flagged Bad Messages:**\n"
+        for bm in intel["bad_messages"][:5]:
+            body += f"• `#{bm['channel_name']}`: \"{bm['content'][:100]}\" *(flags: {bm['bad_words_found']})*\n"
+
+    await _send(message.channel, embeds.ok(body, title="user intelligence"), feedback=False)
+
+
+async def _cmd_badmessages(message, arg, guild_id, author):
+    """View flagged bad/offensive messages for a user."""
+    target = db.find_user_by_name(arg, guild_id) if arg else None
+    uid = target["user_id"] if target else author
+    bad_msgs = db.get_user_bad_messages(uid, guild_id, limit=15)
+    uname = target["display_name"] if target else author
+    if not bad_msgs:
+        await _send(message.channel, embeds.ok(f"No flagged bad messages recorded for **{uname}**.", title="bad messages"), feedback=False)
+        return
+
+    lines = [f"**Flagged Bad Messages** for **{uname}** ({len(bad_msgs)} items):\n"]
+    for bm in bad_msgs:
+        lines.append(f"• `#{bm['channel_name']}`: \"{bm['content'][:120]}\" (words: {bm['bad_words_found']})")
+    await _send(message.channel, embeds.ok("\n".join(lines)[:1900], title="bad messages"), feedback=False)
 
 
 async def _cmd_export(message, arg, guild_id, author):

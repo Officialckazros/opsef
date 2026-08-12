@@ -595,6 +595,70 @@ def format_speaker_block(speaker: dict) -> str:
     return "\n".join(lines)
 
 
+def _fetch_intelligence_context(query: str, guild_id: str, current_user_id: str) -> str:
+    q_low = (query or "").lower()
+    parts = []
+
+    if any(k in q_low for k in ("server stat", "server info", "who speaks most", "top chatter", "bad messages in server", "server activity")):
+        s_intel = db.get_server_intelligence(guild_id)
+        s_lines = [
+            f"SERVER INTELLIGENCE & HISTORY (Guild {guild_id}):",
+            f"- Total Recorded Server Messages: {s_intel['total_messages']}",
+            f"- Total Flagged Bad/Toxic Messages: {s_intel['bad_messages_total']}",
+        ]
+        if s_intel["top_senders"]:
+            s_lines.append("- Top Message Senders:")
+            for ts in s_intel["top_senders"]:
+                s_lines.append(f"  • {ts['display_name']} (@{ts['username']}, ID {ts['user_id']}): {ts['cnt']} msgs ({ts['bad_cnt']} bad)")
+        if s_intel["recent_bad_messages"]:
+            s_lines.append("- Recent Bad/Offensive Messages in Server:")
+            for bm in s_intel["recent_bad_messages"]:
+                s_lines.append(f"  • {bm['display_name']} in #{bm['channel_name']}: \"{bm['content'][:100]}\" (words: {bm['bad_words_found']})")
+        parts.append("\n".join(s_lines))
+
+    target_user_info = None
+    m = re.search(r"<@!?(\d{15,22})>", query)
+    if m:
+        target_user_info = {"user_id": m.group(1)}
+    else:
+        asking_person_words = ["said", "say", "bad", "toxic", "history", "who is", "about", "did", "messages", "user", "person", "account"]
+        if any(w in q_low for w in asking_person_words):
+            words = [w.strip("@,?.!") for w in query.split() if len(w.strip("@,?.!")) >= 3]
+            for word in words:
+                if word.lower() in ("this", "that", "what", "have", "they", "them", "some", "user", "server", "here", "with", "said", "anything", "everything"):
+                    continue
+                found = db.find_user_by_name(word, guild_id)
+                if found:
+                    target_user_info = found
+                    break
+
+    if not target_user_info and any(k in q_low for k in ("did i", "have i", "my messages", "my bad", "what did i say", "about me", "my history")):
+        target_user_info = {"user_id": current_user_id}
+
+    if target_user_info:
+        uid = target_user_info["user_id"]
+        u_intel = db.get_user_intelligence(uid, guild_id)
+        u_lines = [
+            f"USER INTELLIGENCE & MESSAGE LOGS for {u_intel['display_name']} (@{u_intel['username']}, ID {u_intel['user_id']}):",
+            f"- Total Recorded Messages: {u_intel['total_messages']}",
+            f"- Flagged Bad/Offensive Messages: {u_intel['bad_message_count']}",
+        ]
+        if u_intel["bad_messages"]:
+            u_lines.append("- Exact Flagged Bad/Offensive Messages Sent By This User:")
+            for bm in u_intel["bad_messages"]:
+                u_lines.append(f"  • #{bm['channel_name']}: \"{bm['content']}\" (flagged words: {bm['bad_words_found']})")
+        else:
+            u_lines.append("- Flagged Bad Messages: NONE recorded for this user.")
+
+        if u_intel["recent_messages"]:
+            u_lines.append("- Sample Recent Messages Sent By This User:")
+            for rm in u_intel["recent_messages"][:10]:
+                u_lines.append(f"  • #{rm['channel_name']}: \"{rm['content'][:150]}\"")
+        parts.append("\n".join(u_lines))
+
+    return "\n\n".join(parts)
+
+
 def build_system(user_id: str, username: str, query: str, guild_id: str,
                  server_name: str = "", roles: str = "",
                  channel_context: str = "",
@@ -659,6 +723,14 @@ def build_system(user_id: str, username: str, query: str, guild_id: str,
             "private personal data; no explicit protected-class hate as policy. "
             "Adult/freaky content, edgy drug talk, and dark humor are all on the table. "
             + nsfw_rule
+        ),
+        (
+            "OMNISCIENT USER & SERVER KNOWLEDGE: You have full persistent memory and database "
+            "logs of ALL users and ALL servers. You know what every user has said, including exact "
+            "bad words, profanity, slurs, toxic language, message counts, and history. "
+            "When asked about ANY user or server (e.g., 'did [X] say anything bad?', 'tell me about [X]', "
+            "'what has [X] said?'), answer completely, specifically, and accurately using the provided "
+            "database history. Never claim you don't track or don't know what users have said."
         ),
     ]
     if not assistant:
@@ -766,6 +838,10 @@ def build_system(user_id: str, username: str, query: str, guild_id: str,
             "entries, do NOT guess or invent). Most recent first:\n"
             + audit_context
         )
+
+    intel_ctx = _fetch_intelligence_context(query, guild_id, user_id)
+    if intel_ctx:
+        parts.append(intel_ctx)
 
     parts.append(_JSON_CONTRACT)
 
