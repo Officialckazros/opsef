@@ -1624,6 +1624,9 @@ def setup(client: discord.Client, track: Callable) -> app_commands.CommandTree:
         body = (
             "i'm SefBot. i start dumb and get smarter as you use me. i remember things "
             "about you and my mood shifts with the convo.\n\n"
+            "`/user` — ask ANYTHING about any person with full DB memory\n"
+            "`/server` — ask ANYTHING about this server with full DB memory\n"
+            "`/userinfo` · `/badmessages` — inspect user stats & flagged toxic messages\n"
             "`/chat` — talk to me (react up/down on my reply to teach me)\n"
             "`/assistant` — one-shot helpful mode (roles etc.); normal chat stays chaotic\n"
             "`/music` — downloads a song and sends it as an mp3\n"

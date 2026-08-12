@@ -978,6 +978,7 @@ async def _cmd_help(message, arg, guild_id, author):
     body = (
         "mention me or DM me to talk. i grow as you use me.\n\n"
         f"**chat** `@me ...` · react 👍/👎 · reply to correct me · i can react with emoji too\n"
+        f"**intelligence** `{p}user [@user|name] [question]` · `{p}server [question]` · `{p}userinfo [@user]` · `{p}badmessages [@user]`\n"
         f"**memory** `{p}teach` `{p}memories` `{p}memory erase|edit|compact` `{p}forget <id>`\n"
         f"**bond** `{p}bond [@user]` `{p}rivalries` `{p}resetconvo`\n"
         f"**vibe** `{p}mood` `{p}vibecheck` `{p}recap [day|week]` `{p}persona`\n"
