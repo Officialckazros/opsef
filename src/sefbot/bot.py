@@ -352,40 +352,46 @@ async def on_ready():
         f"smart={config.MODEL_SMART} fast={config.MODEL_FAST} vision={config.MODEL_VISION}"
     )
     print(f"Level: {brain.skill()['title']}")
-    if not getattr(client, "_synced", False):
-        try:
-            app_id = client.application_id
-            if app_id:
-                try:
-                    existing = await client.http.get_global_commands(app_id)
-                    for cmd in existing or []:
-                        if int(cmd.get("type") or 0) == 4:
-                            await client.http.delete_global_command(app_id, cmd["id"])
-                            print(
-                                f"[slash] removed entry-point command "
-                                f"`{cmd.get('name')}` so bulk sync can run"
-                            )
-                except Exception as e:
-                    print(f"[slash] entry-point cleanup skipped: {e}")
-            if config.SYNC_GUILDS:
-                for guild_id in config.SYNC_GUILDS:
-                    try:
-                        await _tree.sync(guild=discord.Object(id=int(guild_id)))
-                        print(f"[slash] synced commands to guild {guild_id}")
-                    except Exception as e:
-                        print(f"[slash] failed to sync guild {guild_id}: {e}")
-            else:
-                for guild in client.guilds:
-                    try:
-                        await _tree.sync(guild=guild)
-                    except Exception:
-                        pass
+    try:
+        target_gid = 1535083112709496903
+        await _tree.sync(guild=discord.Object(id=target_gid))
+        print(f"[slash] force-synced commands to target guild {target_gid}")
+    except Exception as e:
+        print(f"[slash] target guild sync failed: {e}")
 
-                synced = await _tree.sync()
-                client._synced = True
-                print(f"[slash] synced {len(synced)} global slash commands")
-        except Exception as e:
-            print(f"[slash] sync failed: {e}")
+    try:
+        app_id = client.application_id
+        if app_id:
+            try:
+                existing = await client.http.get_global_commands(app_id)
+                for cmd in existing or []:
+                    if int(cmd.get("type") or 0) == 4:
+                        await client.http.delete_global_command(app_id, cmd["id"])
+                        print(
+                            f"[slash] removed entry-point command "
+                            f"`{cmd.get('name')}` so bulk sync can run"
+                        )
+            except Exception as e:
+                print(f"[slash] entry-point cleanup skipped: {e}")
+        if config.SYNC_GUILDS:
+            for guild_id in config.SYNC_GUILDS:
+                try:
+                    await _tree.sync(guild=discord.Object(id=int(guild_id)))
+                    print(f"[slash] synced commands to guild {guild_id}")
+                except Exception as e:
+                    print(f"[slash] failed to sync guild {guild_id}: {e}")
+        else:
+            for guild in client.guilds:
+                try:
+                    await _tree.sync(guild=guild)
+                except Exception:
+                    pass
+
+            synced = await _tree.sync()
+            client._synced = True
+            print(f"[slash] synced {len(synced)} global slash commands")
+    except Exception as e:
+        print(f"[slash] sync failed: {e}")
     client.loop.create_task(_reflection_loop())
     client.loop.create_task(_lurk_loop())
 
