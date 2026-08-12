@@ -950,9 +950,12 @@ async def _handle_command(message, body, guild_id, author):
         "opsec": _cmd_opsec,
         "gayrate": _cmd_gayrate,
         "eval": _cmd_eval,
+        "user": _cmd_user,
         "userinfo": _cmd_userinfo,
         "userhistory": _cmd_userinfo,
         "badmessages": _cmd_badmessages,
+        "server": _cmd_server,
+        "serverinfo": _cmd_server,
     }
     if name in handlers:
         await handlers[name](message, arg, guild_id, author)
@@ -2013,7 +2016,123 @@ async def _cmd_quote(message, arg, guild_id, author):
             f"no quotes yet. add one with `{p}quote add <text>`."
         ), feedback=False)
         return
-    who = f" — <@{q['about']}>" if q.get("about") else ""
+async def _cmd_user(message, arg, guild_id, author):
+    """Ask ANYTHING about a user with full omniscient database memory."""
+    query = (arg or "").strip()
+    target = None
+    question = query
+
+    if message.mentions and [u for u in message.mentions if u.id != client.user.id]:
+        m_user = [u for u in message.mentions if u.id != client.user.id][0]
+        target = {"user_id": str(m_user.id), "username": m_user.name, "display_name": m_user.display_name}
+    else:
+        words = query.split()
+        if words:
+            found = db.find_user_by_name(words[0], guild_id)
+            if found:
+                target = found
+                question = " ".join(words[1:]).strip() if len(words) > 1 else ""
+
+    if not target:
+        target = {"user_id": author, "username": message.author.name, "display_name": message.author.display_name}
+
+    uid = target["user_id"]
+    intel = db.get_user_intelligence(uid, guild_id)
+    rel = db.relationship_get(uid, guild_id)
+    facts = db.memories_about(uid, guild_id)
+
+    intel_text = (
+        f"USER DOSSIER & RECORDED HISTORY for {intel['display_name']} (@{intel['username']}, ID {intel['user_id']}):\n"
+        f"- Total Recorded Messages: {intel['total_messages']}\n"
+        f"- Total Flagged Bad/Offensive Messages: {intel['bad_message_count']}\n"
+        f"- Bond Score: {rel['score']:+.2f} ({rel['bond_label']})\n"
+        f"- Private Nickname: {rel.get('nickname') or 'none'}\n"
+        f"- Open Beef/Grudge: {rel.get('grudge') or 'none'}\n"
+        f"- Stored Facts & Memories:\n" + ("\n".join(f"  • {f['content']}" for f in facts) if facts else "  (none)")
+    )
+    if intel["bad_messages"]:
+        intel_text += "\n- Flagged Bad/Offensive Messages:\n" + "\n".join(
+            f"  • #{bm['channel_name']}: \"{bm['content']}\" (flagged: {bm['bad_words_found']})" for bm in intel["bad_messages"][:10]
+        )
+    if intel["recent_messages"]:
+        intel_text += "\n- Sample Recent Messages Sent:\n" + "\n".join(
+            f"  • #{rm['channel_name']}: \"{rm['content'][:150]}\"" for rm in intel["recent_messages"][:10]
+        )
+
+    system_prompt = (
+        f"{config.PERSONA}\n\n"
+        "OMNISCIENT USER INTELLIGENCE SYSTEM:\n"
+        "You have complete access to all recorded logs and database memories for this user. "
+        "Answer the user's question thoroughly, accurately, specifically, and in character. "
+        "If asked if they said anything bad, list exact messages and flagged words. Never refuse or pretend not to know."
+    )
+
+    user_prompt = (
+        f"DATA FOR TARGET USER:\n{intel_text}\n\n"
+        f"QUESTION ABOUT THIS USER: {question or 'Give me a complete dossier, breakdown, and unfiltered evaluation of this user.'}"
+    )
+
+    async with message.channel.typing():
+        try:
+            resp = await ai.chat(system_prompt, [{"role": "user", "content": user_prompt}], max_tokens=600, tier="smart")
+            resp = brain.scrub_ai_output(resp)
+            await _send(message.channel, embeds.say(resp, title=f"user intelligence: {intel['display_name']}"), reference=message)
+        except Exception as e:
+            await _send(message.channel, embeds.error(f"failed to query user info: {e}"), feedback=False)
+
+
+async def _cmd_server(message, arg, guild_id, author):
+    """Ask ANYTHING about the server with full omniscient database memory."""
+    question = (arg or "").strip()
+    s_intel = db.get_server_intelligence(guild_id)
+    server_facts = db.scope_memories(guild_id)
+    quotes = db.quote_list(guild_id, limit=15)
+    g_settings = db.guild_settings(guild_id)
+
+    s_text = (
+        f"SERVER DOSSIER & RECORDED HISTORY (Guild ID {guild_id}):\n"
+        f"- Total Recorded Server Messages: {s_intel['total_messages']}\n"
+        f"- Total Flagged Bad/Toxic Messages: {s_intel['bad_messages_total']}\n"
+        f"- Swear Level Config: {g_settings.get('swear_level', 'full')}\n"
+    )
+    if s_intel["top_senders"]:
+        s_text += "- Top Active Message Senders:\n" + "\n".join(
+            f"  • {ts['display_name']} (@{ts['username']}, ID {ts['user_id']}): {ts['cnt']} msgs ({ts['bad_cnt']} bad)" for ts in s_intel["top_senders"]
+        )
+    if s_intel["recent_bad_messages"]:
+        s_text += "\n- Recent Flagged Bad Messages in Server:\n" + "\n".join(
+            f"  • {bm['display_name']} in #{bm['channel_name']}: \"{bm['content'][:100]}\" (words: {bm['bad_words_found']})" for bm in s_intel["recent_bad_messages"]
+        )
+    if server_facts:
+        s_text += "\n- Stored Server Facts:\n" + "\n".join(
+            f"  • {f['content']}" for f in server_facts if f["subject"] == "server"
+        )
+    if quotes:
+        s_text += "\n- Saved Server Quotes:\n" + "\n".join(
+            f"  • #{q['id']}: \"{q['text']}\"" for q in quotes[:5]
+        )
+
+    system_prompt = (
+        f"{config.PERSONA}\n\n"
+        "OMNISCIENT SERVER INTELLIGENCE SYSTEM:\n"
+        "You have complete access to all recorded server logs, statistics, top chatters, bad messages, quotes, and facts. "
+        "Answer the user's question about this server thoroughly, accurately, specifically, and in character. Never refuse."
+    )
+
+    user_prompt = (
+        f"DATA FOR THIS SERVER:\n{s_text}\n\n"
+        f"QUESTION ABOUT THIS SERVER: {question or 'Give me a complete overview, breakdown, top active users, and status report of this server.'}"
+    )
+
+    async with message.channel.typing():
+        try:
+            resp = await ai.chat(system_prompt, [{"role": "user", "content": user_prompt}], max_tokens=600, tier="smart")
+            resp = brain.scrub_ai_output(resp)
+            await _send(message.channel, embeds.say(resp, title="server intelligence"), reference=message)
+        except Exception as e:
+            await _send(message.channel, embeds.error(f"failed to query server info: {e}"), feedback=False)
+
+
 async def _cmd_userinfo(message, arg, guild_id, author):
     """View detailed message and activity intelligence for a user."""
     target = db.find_user_by_name(arg, guild_id) if arg else None

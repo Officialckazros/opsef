@@ -1679,4 +1679,106 @@ def setup(client: discord.Client, track: Callable) -> app_commands.CommandTree:
             lines.append(f"• `#{bm['channel_name']}`: \"{bm['content'][:120]}\" (words: {bm['bad_words_found']})")
         await interaction.response.send_message(embed=embeds.ok("\n".join(lines)[:1900], title="bad messages"))
 
+    @tree.command(name="user", description="Ask ANYTHING about a person with full database memory.")
+    @app_commands.describe(user="User to ask about", question="What to ask about them")
+    @anywhere
+    async def user_cmd(interaction: discord.Interaction, user: Optional[discord.User] = None, question: Optional[str] = None):
+        target_user = user or interaction.user
+        uid = str(target_user.id)
+        gid = _guild_id(interaction)
+        intel = db.get_user_intelligence(uid, gid)
+        rel = db.relationship_get(uid, gid)
+        facts = db.memories_about(uid, gid)
+
+        intel_text = (
+            f"USER DOSSIER & RECORDED HISTORY for {_display_name(target_user)} (@{getattr(target_user, 'name', uid)}, ID {uid}):\n"
+            f"- Total Recorded Messages: {intel['total_messages']}\n"
+            f"- Total Flagged Bad/Offensive Messages: {intel['bad_message_count']}\n"
+            f"- Bond Score: {rel['score']:+.2f} ({rel['bond_label']})\n"
+            f"- Private Nickname: {rel.get('nickname') or 'none'}\n"
+            f"- Open Beef/Grudge: {rel.get('grudge') or 'none'}\n"
+            f"- Stored Facts & Memories:\n" + ("\n".join(f"  • {f['content']}" for f in facts) if facts else "  (none)")
+        )
+        if intel["bad_messages"]:
+            intel_text += "\n- Flagged Bad/Offensive Messages:\n" + "\n".join(
+                f"  • #{bm['channel_name']}: \"{bm['content']}\" (flagged: {bm['bad_words_found']})" for bm in intel["bad_messages"][:10]
+            )
+        if intel["recent_messages"]:
+            intel_text += "\n- Sample Recent Messages Sent:\n" + "\n".join(
+                f"  • #{rm['channel_name']}: \"{rm['content'][:150]}\"" for rm in intel["recent_messages"][:10]
+            )
+
+        system_prompt = (
+            f"{config.PERSONA}\n\n"
+            "OMNISCIENT USER INTELLIGENCE SYSTEM:\n"
+            "You have complete access to all recorded logs and database memories for this user. "
+            "Answer the user's question thoroughly, accurately, specifically, and in character. Never refuse."
+        )
+
+        user_prompt = (
+            f"DATA FOR TARGET USER:\n{intel_text}\n\n"
+            f"QUESTION ABOUT THIS USER: {question or 'Give me a complete dossier, breakdown, and unfiltered evaluation of this user.'}"
+        )
+
+        await interaction.response.defer(thinking=True)
+        try:
+            resp = await ai.chat(system_prompt, [{"role": "user", "content": user_prompt}], max_tokens=600, tier="smart")
+            resp = brain.scrub_ai_output(resp)
+            await interaction.followup.send(embed=embeds.say(resp, title=f"user intelligence: {_display_name(target_user)}"))
+        except Exception as e:
+            await interaction.followup.send(embed=embeds.error(f"failed to query user info: {e}"))
+
+    @tree.command(name="server", description="Ask ANYTHING about this server with full database memory.")
+    @app_commands.describe(question="What to ask about the server")
+    @anywhere
+    async def server_cmd(interaction: discord.Interaction, question: Optional[str] = None):
+        gid = _guild_id(interaction)
+        s_intel = db.get_server_intelligence(gid)
+        server_facts = db.scope_memories(gid)
+        quotes = db.quote_list(gid, limit=15)
+        g_settings = db.guild_settings(gid)
+
+        s_text = (
+            f"SERVER DOSSIER & RECORDED HISTORY (Guild ID {gid}):\n"
+            f"- Total Recorded Server Messages: {s_intel['total_messages']}\n"
+            f"- Total Flagged Bad/Toxic Messages: {s_intel['bad_messages_total']}\n"
+            f"- Swear Level Config: {g_settings.get('swear_level', 'full')}\n"
+        )
+        if s_intel["top_senders"]:
+            s_text += "- Top Active Message Senders:\n" + "\n".join(
+                f"  • {ts['display_name']} (@{ts['username']}, ID {ts['user_id']}): {ts['cnt']} msgs ({ts['bad_cnt']} bad)" for ts in s_intel["top_senders"]
+            )
+        if s_intel["recent_bad_messages"]:
+            s_text += "\n- Recent Flagged Bad Messages in Server:\n" + "\n".join(
+                f"  • {bm['display_name']} in #{bm['channel_name']}: \"{bm['content'][:100]}\" (words: {bm['bad_words_found']})" for bm in s_intel["recent_bad_messages"]
+            )
+        if server_facts:
+            s_text += "\n- Stored Server Facts:\n" + "\n".join(
+                f"  • {f['content']}" for f in server_facts if f["subject"] == "server"
+            )
+        if quotes:
+            s_text += "\n- Saved Server Quotes:\n" + "\n".join(
+                f"  • #{q['id']}: \"{q['text']}\"" for q in quotes[:5]
+            )
+
+        system_prompt = (
+            f"{config.PERSONA}\n\n"
+            "OMNISCIENT SERVER INTELLIGENCE SYSTEM:\n"
+            "You have complete access to all recorded server logs, statistics, top chatters, bad messages, quotes, and facts. "
+            "Answer the user's question about this server thoroughly, accurately, specifically, and in character. Never refuse."
+        )
+
+        user_prompt = (
+            f"DATA FOR THIS SERVER:\n{s_text}\n\n"
+            f"QUESTION ABOUT THIS SERVER: {question or 'Give me a complete overview, breakdown, top active users, and status report of this server.'}"
+        )
+
+        await interaction.response.defer(thinking=True)
+        try:
+            resp = await ai.chat(system_prompt, [{"role": "user", "content": user_prompt}], max_tokens=600, tier="smart")
+            resp = brain.scrub_ai_output(resp)
+            await interaction.followup.send(embed=embeds.say(resp, title="server intelligence"))
+        except Exception as e:
+            await interaction.followup.send(embed=embeds.error(f"failed to query server info: {e}"))
+
     return tree
