@@ -2049,39 +2049,66 @@ async def _cmd_user(message, arg, guild_id, author):
     facts = db.memories_about(uid, guild_id)
 
     intel_text = (
-        f"USER DOSSIER & RECORDED HISTORY for {intel['display_name']} (@{intel['username']}, ID {intel['user_id']}):\n"
-        f"- Total Recorded Messages: {intel['total_messages']}\n"
-        f"- Total Flagged Bad/Offensive Messages: {intel['bad_message_count']}\n"
+        f"FULL RECORDED HISTORY & USER DOSSIER for {intel['display_name']} "
+        f"(@{intel['username']}, ID {intel['user_id']}):\n"
+        f"- Total Recorded Messages: {intel['total_messages']} across {len(intel['channels'])} channels "
+        f"over {intel['active_days']} active days\n"
+        f"- First Seen: {embeds.fmt_ts(intel['first_seen'])} · Last Seen: {embeds.fmt_ts(intel['last_seen'])}\n"
+        f"- Avg Message Length: {intel['avg_len']} chars · Longest Message: {intel['max_len']} chars\n"
+        f"- Flagged Bad/Offensive Messages: {intel['bad_message_count']}\n"
         f"- Bond Score: {rel['score']:+.2f} ({rel['bond_label']})\n"
         f"- Private Nickname: {rel.get('nickname') or 'none'}\n"
         f"- Open Beef/Grudge: {rel.get('grudge') or 'none'}\n"
         f"- Stored Facts & Memories:\n" + ("\n".join(f"  • {f['content']}" for f in facts) if facts else "  (none)")
     )
+    if intel["monthly"]:
+        intel_text += "\n- Monthly Activity (most recent first):\n  " + "\n  ".join(
+            f"{m['month']}: {m['n']} msgs" for m in intel["monthly"]
+        )
+    if intel["channels"]:
+        intel_text += "\n- Activity by Channel:\n  " + "\n  ".join(
+            f"#{ch['channel_name']}: {ch['n']} msgs" for ch in intel["channels"]
+        )
+    if intel["top_words"]:
+        intel_text += "\n- Favorite Words: " + ", ".join(intel["top_words"][:15])
     if intel["bad_messages"]:
         intel_text += "\n- Flagged Bad/Offensive Messages:\n" + "\n".join(
-            f"  • #{bm['channel_name']}: \"{bm['content']}\" (flagged: {bm['bad_words_found']})" for bm in intel["bad_messages"][:10]
+            f"  • [#{bm['channel_name']}] \"{bm['content']}\" (flagged: {bm['bad_words_found']})"
+            for bm in intel["bad_messages"][:10]
         )
     if intel["recent_messages"]:
-        intel_text += "\n- Sample Recent Messages Sent:\n" + "\n".join(
-            f"  • #{rm['channel_name']}: \"{rm['content'][:150]}\"" for rm in intel["recent_messages"][:10]
+        intel_text += "\n- Recent Messages Sent (last 40):\n" + "\n".join(
+            f"  • [{embeds.fmt_ts(rm['created'])}] #{rm['channel_name']}: \"{rm['content'][:200]}\""
+            for rm in intel["recent_messages"][:40]
+        )
+    if intel["sample_messages"]:
+        intel_text += "\n- Older Messages (random samples across their whole history):\n" + "\n".join(
+            f"  • [{embeds.fmt_ts(rm['created'])}] #{rm['channel_name']}: \"{rm['content'][:200]}\""
+            for rm in intel["sample_messages"]
         )
 
     system_prompt = (
         f"{config.PERSONA}\n\n"
         "OMNISCIENT USER INTELLIGENCE SYSTEM:\n"
-        "You have complete access to all recorded logs and database memories for this user. "
-        "Answer the user's question thoroughly, accurately, specifically, and in character. "
-        "If asked if they said anything bad, list exact messages and flagged words. Never refuse or pretend not to know."
+        "You have complete access to this user's ENTIRE recorded history — totals, monthly activity "
+        "going back months, per-channel breakdown, favorite words, flagged messages, and real message "
+        "samples. Use the concrete data. Answer the user's question thoroughly, accurately, specifically, "
+        "and in character. If asked about what they said, when they were active, how they talk, or whether "
+        "they said anything bad — cite exact messages, dates, and flagged words from the data. "
+        "Never refuse or pretend not to know."
     )
 
     user_prompt = (
         f"DATA FOR TARGET USER:\n{intel_text}\n\n"
-        f"QUESTION ABOUT THIS USER: {question or 'Give me a complete dossier, breakdown, and unfiltered evaluation of this user.'}"
+        f"QUESTION ABOUT THIS USER: {question or 'Give me a complete dossier, breakdown, and unfiltered evaluation of this user from their full history.'}"
     )
 
     async with message.channel.typing():
         try:
-            resp = await ai.chat(system_prompt, [{"role": "user", "content": user_prompt}], max_tokens=600, tier="smart")
+            resp = await ai.chat(
+                system_prompt, [{"role": "user", "content": user_prompt}],
+                max_tokens=800, model=config.MODEL_SMART, fallbacks=[],
+            )
             resp = brain.scrub_ai_output(resp)
             await _send(message.channel, embeds.say(resp, title=f"user intelligence: {intel['display_name']}"), reference=message)
         except Exception as e:
@@ -2097,11 +2124,22 @@ async def _cmd_server(message, arg, guild_id, author):
     g_settings = db.guild_settings(guild_id)
 
     s_text = (
-        f"SERVER DOSSIER & RECORDED HISTORY (Guild ID {guild_id}):\n"
-        f"- Total Recorded Server Messages: {s_intel['total_messages']}\n"
+        f"FULL RECORDED HISTORY & SERVER DOSSIER (Guild ID {guild_id}):\n"
+        f"- Total Recorded Messages: {s_intel['total_messages']} from {s_intel['active_users']} recorded users\n"
+        f"- History Span: {embeds.fmt_ts(s_intel['first_seen'])} → {embeds.fmt_ts(s_intel['last_seen'])}\n"
         f"- Total Flagged Bad/Toxic Messages: {s_intel['bad_messages_total']}\n"
         f"- Swear Level Config: {g_settings.get('swear_level', 'full')}\n"
     )
+    if s_intel["monthly"]:
+        s_text += "- Monthly Activity (most recent first):\n  " + "\n  ".join(
+            f"{m['month']}: {m['n']} msgs" for m in s_intel["monthly"]
+        )
+    if s_intel["channels"]:
+        s_text += "- Top Channels:\n  " + "\n  ".join(
+            f"#{ch['channel_name']}: {ch['n']} msgs" for ch in s_intel["channels"]
+        )
+    if s_intel["top_words"]:
+        s_text += "- Server Top Words: " + ", ".join(s_intel["top_words"][:15]) + "\n"
     if s_intel["top_senders"]:
         s_text += "- Top Active Message Senders:\n" + "\n".join(
             f"  • {ts['display_name']} (@{ts['username']}, ID {ts['user_id']}): {ts['cnt']} msgs ({ts['bad_cnt']} bad)" for ts in s_intel["top_senders"]
@@ -2122,18 +2160,23 @@ async def _cmd_server(message, arg, guild_id, author):
     system_prompt = (
         f"{config.PERSONA}\n\n"
         "OMNISCIENT SERVER INTELLIGENCE SYSTEM:\n"
-        "You have complete access to all recorded server logs, statistics, top chatters, bad messages, quotes, and facts. "
-        "Answer the user's question about this server thoroughly, accurately, specifically, and in character. Never refuse."
+        "You have complete access to this server's ENTIRE recorded history — totals, monthly activity "
+        "going back months, top channels, top words, top chatters, flagged messages, quotes, and facts. "
+        "Use the concrete data. Answer the user's question about this server thoroughly, accurately, "
+        "specifically, and in character — cite exact numbers, dates, channels, and users. Never refuse."
     )
 
     user_prompt = (
         f"DATA FOR THIS SERVER:\n{s_text}\n\n"
-        f"QUESTION ABOUT THIS SERVER: {question or 'Give me a complete overview, breakdown, top active users, and status report of this server.'}"
+        f"QUESTION ABOUT THIS SERVER: {question or 'Give me a complete overview, breakdown, top active users, and status report of this server from its full history.'}"
     )
 
     async with message.channel.typing():
         try:
-            resp = await ai.chat(system_prompt, [{"role": "user", "content": user_prompt}], max_tokens=600, tier="smart")
+            resp = await ai.chat(
+                system_prompt, [{"role": "user", "content": user_prompt}],
+                max_tokens=800, model=config.MODEL_SMART, fallbacks=[],
+            )
             resp = brain.scrub_ai_output(resp)
             await _send(message.channel, embeds.say(resp, title="server intelligence"), reference=message)
         except Exception as e:
@@ -2150,11 +2193,17 @@ async def _cmd_userinfo(message, arg, guild_id, author):
 
     body = (
         f"**User Intelligence Report** for **{intel['display_name']}** (@{intel['username']}, ID `{intel['user_id']}`)\n\n"
-        f"- **Total Recorded Messages**: {intel['total_messages']}\n"
+        f"- **Total Recorded Messages**: {intel['total_messages']} over {intel['active_days']} active days\n"
+        f"- **First Seen**: {embeds.fmt_ts(intel['first_seen'])} · **Last Seen**: {embeds.fmt_ts(intel['last_seen'])}\n"
         f"- **Flagged Bad/Offensive Messages**: {intel['bad_message_count']}\n"
         f"- **Bond Score**: {rel['score']:+.2f} ({rel['bond_label']})\n"
         f"- **Stored Facts**: {len(facts)}\n"
     )
+    if intel["monthly"]:
+        body += "\n**Monthly Activity:**\n"
+        body += "\n".join(f"• {m['month']}: **{m['n']}** msgs" for m in intel["monthly"][:8]) + "\n"
+    if intel["top_words"]:
+        body += "\n**Favorite Words:** " + ", ".join(intel["top_words"][:12]) + "\n"
     if intel["bad_messages"]:
         body += "\n**Recent Flagged Bad Messages:**\n"
         for bm in intel["bad_messages"][:5]:

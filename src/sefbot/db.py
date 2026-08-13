@@ -901,25 +901,94 @@ def record_server_message(
     c.commit()
 
 
+_STOP_WORDS = {
+    "and", "the", "to", "a", "of", "in", "is", "you", "i", "it", "that", "for",
+    "on", "my", "me", "we", "they", "are", "was", "this", "with", "your", "at",
+    "be", "but", "so", "like", "just", "have", "has", "not", "do", "did", "im",
+    "u", "ur", "what", "when", "who", "how", "why", "can", "cant", "dont", "get",
+    "go", "up", "out", "off", "no", "yeah", "yes", "ok", "okay", "lol", "lmao",
+    "fr", "ngl", "tbh", "rn", "bro", "man", "guys", "about", "there", "here",
+    "them", "him", "her", "his", "their", "would", "could", "should", "will",
+    "am", "an", "or", "as", "if", "than", "then", "too", "very", "really",
+    "actually", "know", "think", "say", "said", "says", "want", "need", "let",
+    "tell", "make", "made", "come", "came", "see", "look", "back", "been",
+    "being", "from", "into", "over", "under", "again", "more", "most", "some",
+    "any", "all", "every", "one", "two", "time", "day", "still", "even",
+    "though", "though", "thing", "things", "cause", "cuz", "cause", "gonna",
+    "wanna", "gotta", "dont", "didnt", "doesnt", "wasnt", "isnt", "arent",
+    "aint", "idk", "ikr", "omg", "wtf", "bruh", "dude", "yall", "y'all",
+}
+
+
+def _top_words(rows: List[sqlite3.Row], n: int = 20) -> List[str]:
+    """Most common non-stop words across a batch of recorded messages."""
+    from collections import Counter
+    cnt = Counter()
+    for r in rows:
+        content = r["content"] or ""
+        cnt.update(
+            w for w in _WORD.findall(content.lower())
+            if w not in _STOP_WORDS
+        )
+    return [w for w, _ in cnt.most_common(n)]
+
+
 def get_user_intelligence(user_id: str, guild_id: Optional[str] = None) -> dict:
+    """Full recorded history for a user — totals, monthly activity, channels,
+    favorite words, flagged messages, recent + random old message samples."""
     c = conn()
     uid = str(user_id)
     gid = str(guild_id) if guild_id and guild_id != "dm" else None
-
+    w = "user_id=?"
+    args = [uid]
     if gid:
-        total_row = c.execute("SELECT COUNT(*) n FROM server_messages WHERE user_id=? AND guild_id=?", (uid, gid)).fetchone()
-        bad_row = c.execute("SELECT COUNT(*) n FROM server_messages WHERE user_id=? AND guild_id=? AND has_bad_words=1", (uid, gid)).fetchone()
-        timestamps = c.execute("SELECT MIN(created) min_ts, MAX(created) max_ts FROM server_messages WHERE user_id=? AND guild_id=?", (uid, gid)).fetchone()
-        bad_msgs = c.execute("SELECT channel_name, content, bad_words_found, created FROM server_messages WHERE user_id=? AND guild_id=? AND has_bad_words=1 ORDER BY created DESC LIMIT 15", (uid, gid)).fetchall()
-        recent_msgs = c.execute("SELECT channel_name, content, created FROM server_messages WHERE user_id=? AND guild_id=? ORDER BY created DESC LIMIT 15", (uid, gid)).fetchall()
-    else:
-        total_row = c.execute("SELECT COUNT(*) n FROM server_messages WHERE user_id=?", (uid,)).fetchone()
-        bad_row = c.execute("SELECT COUNT(*) n FROM server_messages WHERE user_id=? AND has_bad_words=1", (uid,)).fetchone()
-        timestamps = c.execute("SELECT MIN(created) min_ts, MAX(created) max_ts FROM server_messages WHERE user_id=?", (uid,)).fetchone()
-        bad_msgs = c.execute("SELECT channel_name, content, bad_words_found, created FROM server_messages WHERE user_id=? AND has_bad_words=1 ORDER BY created DESC LIMIT 15", (uid,)).fetchall()
-        recent_msgs = c.execute("SELECT channel_name, content, created FROM server_messages WHERE user_id=?", (uid,)).fetchall()
+        w += " AND guild_id=?"
+        args.append(gid)
 
-    user_info = c.execute("SELECT username, display_name FROM server_messages WHERE user_id=? ORDER BY created DESC LIMIT 1", (uid,)).fetchone()
+    def q(sql: str, extra: str = "", limit: int = None):
+        lim = f" LIMIT {int(limit)}" if limit else ""
+        return c.execute(sql.format(w=w) + extra + lim, tuple(args))
+
+    total_row = q("SELECT COUNT(*) n FROM server_messages WHERE {w}").fetchone()
+    bad_row = q("SELECT COUNT(*) n FROM server_messages WHERE {w} AND has_bad_words=1").fetchone()
+    ts = q("SELECT MIN(created) min_ts, MAX(created) max_ts FROM server_messages WHERE {w}").fetchone()
+    day_row = q(
+        "SELECT COUNT(DISTINCT strftime('%Y-%m-%d', created, 'unixepoch')) d "
+        "FROM server_messages WHERE {w}"
+    ).fetchone()
+    len_row = q(
+        "SELECT AVG(LENGTH(content)) avg_len, MAX(LENGTH(content)) max_len "
+        "FROM server_messages WHERE {w}"
+    ).fetchone()
+    bad_msgs = q(
+        "SELECT channel_name, content, bad_words_found, created FROM server_messages "
+        "WHERE {w} AND has_bad_words=1 ORDER BY created DESC", limit=15
+    ).fetchall()
+    recent_msgs = q(
+        "SELECT channel_name, content, created FROM server_messages "
+        "WHERE {w} ORDER BY created DESC", limit=60
+    ).fetchall()
+    sample_msgs = q(
+        "SELECT channel_name, content, created FROM ("
+        "SELECT channel_name, content, created FROM server_messages "
+        "WHERE {w} ORDER BY created DESC LIMIT 5000"
+        ") ORDER BY RANDOM()", limit=12
+    ).fetchall()
+    monthly = q(
+        "SELECT strftime('%Y-%m', created, 'unixepoch') m, COUNT(*) n "
+        "FROM server_messages WHERE {w} GROUP BY m ORDER BY m DESC", limit=12
+    ).fetchall()
+    channels = q(
+        "SELECT channel_name, COUNT(*) n FROM server_messages WHERE {w} "
+        "GROUP BY channel_name ORDER BY n DESC", limit=8
+    ).fetchall()
+    word_rows = q(
+        "SELECT content FROM server_messages WHERE {w} ORDER BY created DESC", limit=2000
+    ).fetchall()
+    user_info = c.execute(
+        "SELECT username, display_name FROM server_messages WHERE user_id=? ORDER BY created DESC LIMIT 1",
+        (uid,),
+    ).fetchone()
 
     return {
         "user_id": uid,
@@ -927,10 +996,17 @@ def get_user_intelligence(user_id: str, guild_id: Optional[str] = None) -> dict:
         "display_name": user_info["display_name"] if user_info else uid,
         "total_messages": total_row["n"] if total_row else 0,
         "bad_message_count": bad_row["n"] if bad_row else 0,
-        "first_seen": timestamps["min_ts"] if timestamps else None,
-        "last_seen": timestamps["max_ts"] if timestamps else None,
+        "first_seen": ts["min_ts"] if ts else None,
+        "last_seen": ts["max_ts"] if ts else None,
+        "active_days": day_row["d"] if day_row else 0,
+        "avg_len": int(len_row["avg_len"] or 0) if len_row else 0,
+        "max_len": int(len_row["max_len"] or 0) if len_row else 0,
         "bad_messages": [dict(r) for r in bad_msgs],
         "recent_messages": [dict(r) for r in recent_msgs],
+        "sample_messages": [dict(r) for r in sample_msgs],
+        "monthly": [{"month": r["m"], "n": r["n"]} for r in monthly],
+        "channels": [{"channel_name": r["channel_name"] or "unknown", "n": r["n"]} for r in channels],
+        "top_words": _top_words(word_rows, 20),
     }
 
 
@@ -954,10 +1030,16 @@ def get_user_bad_messages(user_id: str, guild_id: Optional[str] = None, limit: i
 
 
 def get_server_intelligence(guild_id: str) -> dict:
+    """Full recorded history for a server — totals, active users, monthly
+    activity, top channels, top words, top senders, flagged messages."""
     c = conn()
     gid = str(guild_id)
     total = c.execute("SELECT COUNT(*) n FROM server_messages WHERE guild_id=?", (gid,)).fetchone()["n"]
     bad_total = c.execute("SELECT COUNT(*) n FROM server_messages WHERE guild_id=? AND has_bad_words=1", (gid,)).fetchone()["n"]
+    users = c.execute("SELECT COUNT(DISTINCT user_id) n FROM server_messages WHERE guild_id=?", (gid,)).fetchone()["n"]
+    ts = c.execute(
+        "SELECT MIN(created) min_ts, MAX(created) max_ts FROM server_messages WHERE guild_id=?", (gid,)
+    ).fetchone()
     top_senders = c.execute(
         "SELECT user_id, username, display_name, COUNT(*) cnt, "
         "SUM(has_bad_words) bad_cnt FROM server_messages WHERE guild_id=? "
@@ -967,12 +1049,29 @@ def get_server_intelligence(guild_id: str) -> dict:
         "SELECT username, display_name, channel_name, content, bad_words_found, created "
         "FROM server_messages WHERE guild_id=? AND has_bad_words=1 ORDER BY created DESC LIMIT 10", (gid,)
     ).fetchall()
+    monthly = c.execute(
+        "SELECT strftime('%Y-%m', created, 'unixepoch') m, COUNT(*) n "
+        "FROM server_messages WHERE guild_id=? GROUP BY m ORDER BY m DESC LIMIT 12", (gid,)
+    ).fetchall()
+    channels = c.execute(
+        "SELECT channel_name, COUNT(*) n FROM server_messages WHERE guild_id=? "
+        "GROUP BY channel_name ORDER BY n DESC LIMIT 8", (gid,)
+    ).fetchall()
+    word_rows = c.execute(
+        "SELECT content FROM server_messages WHERE guild_id=? ORDER BY created DESC LIMIT 3000", (gid,)
+    ).fetchall()
     return {
         "guild_id": gid,
         "total_messages": total,
         "bad_messages_total": bad_total,
+        "active_users": users,
+        "first_seen": ts["min_ts"] if ts else None,
+        "last_seen": ts["max_ts"] if ts else None,
         "top_senders": [dict(r) for r in top_senders],
         "recent_bad_messages": [dict(r) for r in recent_bad],
+        "monthly": [{"month": r["m"], "n": r["n"]} for r in monthly],
+        "channels": [{"channel_name": r["channel_name"] or "unknown", "n": r["n"]} for r in channels],
+        "top_words": _top_words(word_rows, 20),
     }
 
 

@@ -1,5 +1,6 @@
 """Embed helpers. Every user-facing message goes out as an embed, and all text
 is run through de_emoji() so the bot never emits emoji (per design)."""
+import datetime
 import re
 
 import discord
@@ -26,6 +27,18 @@ def de_emoji(text: str) -> str:
         return text
     text = _EMOJI.sub("", text)
     return re.sub(r"[ ]{2,}", " ", text).strip()
+
+
+def fmt_ts(ts) -> str:
+    """Format a unix timestamp (seconds) as UTC 'YYYY-MM-DD HH:MM'."""
+    if not ts:
+        return "?"
+    try:
+        return datetime.datetime.fromtimestamp(float(ts), tz=datetime.timezone.utc).strftime(
+            "%Y-%m-%d %H:%M"
+        )
+    except (ValueError, OSError, TypeError):
+        return "?"
 
 
 def _clip(text: str, limit: int) -> str:
