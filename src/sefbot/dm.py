@@ -12,6 +12,7 @@ Fire a single message and exit, no shell:
 import argparse
 import asyncio
 import json
+import os
 import sys
 import time
 from datetime import datetime
@@ -25,9 +26,14 @@ from sefbot import config
 INTENTS = discord.Intents.default()
 INTENTS.dm_messages = True
 
-CONTACTS_FILE = Path(__file__).resolve().parent.parent.parent / "dm_contacts.json"
+_ROOT = Path(__file__).resolve().parent.parent.parent
+CONTACTS_FILE = Path(
+    os.getenv("SEFBOT_DM_CONTACTS_FILE", str(_ROOT / "dm_contacts.json"))
+)
 
-ACTIVE_CHATS_FILE = Path(__file__).resolve().parent.parent.parent / "cli_active_chats.json"
+ACTIVE_CHATS_FILE = Path(
+    os.getenv("SEFBOT_CLI_ACTIVE_FILE", str(_ROOT / "cli_active_chats.json"))
+)
 ACTIVE_HEARTBEAT_SECONDS = 20
 
 HELP_TEXT = """\

@@ -98,7 +98,10 @@ _lurk_channels = {}
 
 UP, DOWN = "\U0001F44D", "\U0001F44E"
 
-_CLI_ACTIVE_FILE = Path(__file__).resolve().parent.parent.parent / "cli_active_chats.json"
+_ROOT = Path(__file__).resolve().parent.parent.parent
+_CLI_ACTIVE_FILE = Path(
+    os.getenv("SEFBOT_CLI_ACTIVE_FILE", str(_ROOT / "cli_active_chats.json"))
+)
 _CLI_ACTIVE_TTL = 90
 
 

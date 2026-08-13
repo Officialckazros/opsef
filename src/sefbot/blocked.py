@@ -20,7 +20,10 @@ import time
 from pathlib import Path
 from typing import Dict, Optional, Set
 
-BLOCKED_FILE = Path(__file__).resolve().parent.parent.parent / "blocked_users.json"
+_ROOT = Path(__file__).resolve().parent.parent.parent
+BLOCKED_FILE = Path(
+    os.getenv("SEFBOT_BLOCKED_FILE", str(_ROOT / "blocked_users.json"))
+)
 
 _cache_ids: Optional[Set[str]] = None
 _cache_meta: Optional[Dict[str, dict]] = None
