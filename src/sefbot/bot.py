@@ -1640,7 +1640,8 @@ async def _cmd_model(message, arg, guild_id, author):
     if not raw or low in ("help", "?", "status", "list", "show"):
         body = (
             "this server's brain runs on " + config.model_display(current) + ".\n\n"
-            f"switch with `{p}model inferx` (DeepSeek V4 Flash, default) or "
+            f"switch with `{p}model inferx` (DeepSeek V4 Flash, default), "
+            f"`{p}model big` (free Nemotron 3 Ultra — 1M context), or "
             f"`{p}model groq` (Llama 3.3 70B Versatile). `{p}model reset` goes back to default."
         )
         await _send(message.channel, embeds.say(body, title="model"), feedback=False)
@@ -1665,7 +1666,7 @@ async def _cmd_model(message, arg, guild_id, author):
         print(f"[model] switch failed: alias={low!r} available={sorted(config.MODEL_SWITCHER)}")
         await _send(
             message.channel,
-            embeds.error(f"unknown model `{raw}`. options: `inferx`, `groq` (or `{p}model` for current)."),
+            embeds.error(f"unknown model `{raw}`. options: `inferx`, `big`, `groq` (or `{p}model` for current)."),
             feedback=False,
         )
         return

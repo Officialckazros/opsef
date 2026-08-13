@@ -92,6 +92,18 @@ MODEL_VISION_FALLBACKS = [
     ).split(",") if m.strip()
 ]
 MODEL_EXPERT = DEFAULT_MODEL
+MODEL_BIG = os.getenv(
+    "SEFBOT_MODEL_BIG", "or:nvidia/nemotron-3-ultra-550b-a55b:free"
+)
+MODEL_BIG_FALLBACKS = [
+    m.strip() for m in os.getenv(
+        "SEFBOT_MODEL_BIG_FALLBACKS",
+        "or:nvidia/nemotron-3.5-lightning:free,"
+        "or:nvidia/nemotron-3-super-120b-a12b:free,"
+        "or:google/gemma-4-31b-it:free,"
+        "llama-3.3-70b-versatile",
+    ).split(",") if m.strip()
+]
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 MODEL_EXPERT_FALLBACKS = [
@@ -118,9 +130,12 @@ for _k in [os.getenv("GEMINI_API_KEY", "")] + os.getenv("GEMINI_API_KEYS", "").s
 MODEL_FALLBACKS = [
     m.strip() for m in os.getenv(
         "SEFBOT_MODEL_FALLBACKS",
-        "mercury-2,celeris-1,llama-3.3-70b-versatile,openai/gpt-oss-20b,"
-        "or:nvidia/nemotron-3-ultra-550b-a55b:free,llama-3.1-8b-instant,"
-        "gemini-3.5-flash-lite,or:nvidia/nemotron-3-super-120b-a12b:free,"
+        "mercury-2,celeris-1,"
+        "or:nvidia/nemotron-3-ultra-550b-a55b:free,"
+        "or:nvidia/nemotron-3.5-lightning:free,"
+        "llama-3.3-70b-versatile,openai/gpt-oss-20b,"
+        "llama-3.1-8b-instant,gemini-3.5-flash-lite,"
+        "or:nvidia/nemotron-3-super-120b-a12b:free,"
         "or:openrouter/free,cb:gpt-oss-120b",
     ).split(",") if m.strip()
 ]
@@ -132,6 +147,11 @@ MODEL_SWITCHER = {
     "inferx": DEFAULT_MODEL,
     "deepseek": DEFAULT_MODEL,
     "ix": DEFAULT_MODEL,
+    "big": MODEL_BIG,
+    "nemotron": MODEL_BIG,
+    "ultra": MODEL_BIG,
+    "free": MODEL_BIG,
+    "1m": MODEL_BIG,
     "groq": "llama-3.3-70b-versatile",
     "groq-llama": "llama-3.3-70b-versatile",
     "llama": "llama-3.3-70b-versatile",
@@ -145,6 +165,8 @@ MODEL_SWITCHER = {
 
 def model_display(model: str) -> str:
     """Human label for a model id (used by !model / /model)."""
+    if model == MODEL_BIG:
+        return "free big-brain — NVIDIA Nemotron 3 Ultra 550B (1M context)"
     if model == DEFAULT_MODEL:
         return "InferX DeepSeek V4 Flash (`ix:deepseek-v4-flash`)"
     if model == "llama-3.3-70b-versatile":

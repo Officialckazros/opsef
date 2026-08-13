@@ -829,6 +829,8 @@ def _resolve_model(tier: str) -> str:
         return config.MODEL_VISION
     if t == "expert":
         return config.MODEL_EXPERT
+    if t == "big":
+        return config.MODEL_BIG
     return config.MODEL_SMART
 
 
@@ -849,7 +851,10 @@ async def chat(
     """
     use_model = model or _resolve_model(tier)
     if fallbacks is None:
-        fallbacks = config.MODEL_EXPERT_FALLBACKS if tier == "expert" else None
+        if tier == "expert":
+            fallbacks = config.MODEL_EXPERT_FALLBACKS
+        elif tier == "big":
+            fallbacks = config.MODEL_BIG_FALLBACKS
     if tier == "vision" and fallbacks is None:
         fallbacks = []
 

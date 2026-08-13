@@ -744,6 +744,7 @@ def setup(client: discord.Client, track: Callable) -> app_commands.CommandTree:
     @app_commands.describe(choice="which model to use (empty = show current)")
     @app_commands.choices(choice=[
         app_commands.Choice(name="InferX DeepSeek V4 Flash (default)", value="inferx"),
+        app_commands.Choice(name="Free Nemotron 3 Ultra 550B (1M context)", value="big"),
         app_commands.Choice(name="Groq Llama 3.3 70B Versatile", value="groq"),
     ])
     @anywhere
