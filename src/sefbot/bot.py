@@ -504,10 +504,30 @@ async def _enforce_tos_violation(
     author: str,
     reason: str,
     *,
+    action: str = "block",
+    strikes: int = 0,
     trigger_source: str = "message",
     strikes_detail: str = "",
 ) -> None:
-    """Hard-block a user for a ToS breach and tell them once."""
+    """Handle a ToS violation: warn on early strikes, hard-block at the limit."""
+    if action == "warn":
+        print(f"[tos] warned {author}: {reason} (strike {strikes}/{tos.TOS_STRIKE_LIMIT})")
+        try:
+            await _send(
+                message.channel,
+                embeds.error(
+                    f"**ToS warning** — that triggered a violation flag (**{reason}**), "
+                    f"so this message wasn't processed.\n"
+                    f"_(strike {strikes}/{tos.TOS_STRIKE_LIMIT} — the "
+                    f"{tos.TOS_STRIKE_LIMIT}th is an auto-block · {tos.TOS_URL})_"
+                ),
+                feedback=False,
+                reference=message,
+            )
+        except Exception:
+            pass
+        return
+
     guild_id = str(message.guild.id) if message.guild else "dm"
     guild_name = message.guild.name if message.guild else "DM"
     channel_id = str(message.channel.id) if getattr(message, "channel", None) else ""
@@ -580,9 +600,12 @@ async def on_message(message: discord.Message):
         or is_dm
     )
     if directed:
-        viol = tos.check_message(author, content)
-        if viol:
-            await _enforce_tos_violation(message, author, viol)
+        res = tos.check_message(author, content)
+        if res:
+            action, reason, strikes = res
+            await _enforce_tos_violation(
+                message, author, reason, action=action, strikes=strikes
+            )
             return
 
     if message.guild:
@@ -635,9 +658,12 @@ async def _chat(message, query, guild_id, author, force_assistant: bool = False)
         )
         return
 
-    viol = tos.check_message(author, query)
-    if viol:
-        await _enforce_tos_violation(message, author, viol)
+    res = tos.check_message(author, query)
+    if res:
+        action, reason, strikes = res
+        await _enforce_tos_violation(
+            message, author, reason, action=action, strikes=strikes
+        )
         return
 
     now_ts = time.time()

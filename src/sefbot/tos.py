@@ -4,7 +4,8 @@ Canonical page:
   https://wearegays.net/opsef-tos.html
 
 Users must `!tos accept` (current version) before normal bot use.
-Clear ToS violations hard-block the Discord user id via blocked.py.
+Clear ToS violations warn first; after TOS_STRIKE_LIMIT strikes the user is
+hard-blocked via blocked.py.
 """
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ TOS_VERSION = "1.0"
 TOS_URL = "https://wearegays.net/opsef-tos.html"
 PRIVACY_URL = "https://wearegays.net/opsef-privacy.html"
 
+TOS_STRIKE_LIMIT = 3
 _LEAK_STRIKE_LIMIT = 3
 _SPAM_WINDOW_SEC = 20.0
 _SPAM_MAX = 12
@@ -259,12 +261,14 @@ def is_emergency_blocked(user_id) -> bool:
     return db.user_flag_get(_uid(user_id), "tos_emergency_block") == "1"
 
 
-def check_message(user_id, text: str) -> Optional[str]:
+def check_message(user_id, text: str):
     """
     Run ToS detectors on a user message.
 
-    Returns a block reason if the user should be hard-blocked now, else None.
-    Does not itself perform the block (caller should hard_block + reply).
+    Returns (action, reason, strikes) with action "warn" or "block", or None
+    if no violation. Hard violations warn for the first TOS_STRIKE_LIMIT - 1
+    strikes and only block on the TOS_STRIKE_LIMIT-th. Callers should reply
+    with the warning on "warn" and hard_block + blocked reply on "block".
     """
     uid = _uid(user_id)
     if not uid or config.is_bot_owner(uid):
@@ -272,15 +276,18 @@ def check_message(user_id, text: str) -> Optional[str]:
 
     info = detect_hard_violation_info(text or "")
     if info:
-        return info[0]
+        reason, _cat = info
+        n = _strike(uid, "tos_violation_strikes")
+        action = "block" if n >= TOS_STRIKE_LIMIT else "warn"
+        return action, reason, n
 
     if text and _SPAM_RE.search(text):
         n = _strike(uid, "tos_spam_strikes")
         if n >= 5:
-            return "repeated spam content"
+            return "block", "repeated spam content", n
 
     if note_message_for_spam(uid):
-        return "spam / abuse flood"
+        return "block", "spam / abuse flood", 1
 
     return None
 

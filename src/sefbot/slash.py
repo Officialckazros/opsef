@@ -152,16 +152,25 @@ async def _generate_reply(
     if not tos.has_accepted(author):
         return embeds.say(tos.need_accept_message("!"), title="terms of service"), None
 
-    viol = tos.check_message(author, query)
-    if viol:
+    res = tos.check_message(author, query)
+    if res:
+        action, reason, strikes = res
         guild_id_str = str(interaction.guild_id) if interaction.guild_id else "dm"
         guild_name_str = interaction.guild.name if interaction.guild else "DM"
         channel_id_str = str(interaction.channel_id) if interaction.channel_id else ""
         user_tag_str = str(interaction.user)
 
+        if action == "warn":
+            return embeds.error(
+                f"**ToS warning** — that triggered a violation flag (**{reason}**), "
+                f"so this message wasn't processed.\n"
+                f"_(strike {strikes}/{tos.TOS_STRIKE_LIMIT} — the "
+                f"{tos.TOS_STRIKE_LIMIT}th is an auto-block · {tos.TOS_URL})_"
+            ), None
+
         tos.hard_block(
             author,
-            viol,
+            reason,
             offending_text=query,
             guild_id=guild_id_str,
             guild_name=guild_name_str,
@@ -169,9 +178,9 @@ async def _generate_reply(
             user_tag=user_tag_str,
             trigger_source="slash_chat",
         )
-        print(f"[tos] blocked {author} ({user_tag_str}): {viol}")
+        print(f"[tos] blocked {author} ({user_tag_str}): {reason}")
         return embeds.error(
-            f"you broke the OpSef Terms of Service (**{viol}**) and have been "
+            f"you broke the OpSef Terms of Service (**{reason}**) and have been "
             f"**blocked**.\n{tos.TOS_URL}"
         ), None
 
@@ -385,16 +394,30 @@ class _BlockingTree(app_commands.CommandTree):
                     if isinstance(opt, dict) and opt.get("value") is not None:
                         raw_bits.append(str(opt["value"]))
             blob = " ".join(raw_bits)
-            viol = tos.check_message(str(uid), blob) if blob else None
-            if viol:
+            res = tos.check_message(str(uid), blob) if blob else None
+            if res:
+                action, reason, strikes = res
                 guild_id_str = str(interaction.guild_id) if interaction.guild_id else "dm"
                 guild_name_str = interaction.guild.name if interaction.guild else "DM"
                 channel_id_str = str(interaction.channel_id) if interaction.channel_id else ""
                 user_tag_str = str(interaction.user)
 
+                if action == "warn":
+                    msg = (
+                        f"**ToS warning** — that triggered a violation flag (**{reason}**), "
+                        f"so this command wasn't run.\n"
+                        f"_(strike {strikes}/{tos.TOS_STRIKE_LIMIT} — the "
+                        f"{tos.TOS_STRIKE_LIMIT}th is an auto-block · {tos.TOS_URL})_"
+                    )
+                    if interaction.response.is_done():
+                        await interaction.followup.send(msg, ephemeral=True)
+                    else:
+                        await interaction.response.send_message(msg, ephemeral=True)
+                    return False
+
                 tos.hard_block(
                     uid,
-                    viol,
+                    reason,
                     offending_text=blob,
                     guild_id=guild_id_str,
                     guild_name=guild_name_str,
@@ -402,9 +425,9 @@ class _BlockingTree(app_commands.CommandTree):
                     user_tag=user_tag_str,
                     trigger_source="slash_options",
                 )
-                print(f"[tos] slash-blocked {uid} ({user_tag_str}): {viol}")
+                print(f"[tos] slash-blocked {uid} ({user_tag_str}): {reason}")
                 msg = (
-                    f"you broke the OpSef Terms of Service (**{viol}**) and have been "
+                    f"you broke the OpSef Terms of Service (**{reason}**) and have been "
                     f"**blocked**.\n{tos.TOS_URL}"
                 )
                 if interaction.response.is_done():
