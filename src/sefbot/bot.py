@@ -10,29 +10,41 @@ Run: python bot.py
 import asyncio
 import collections
 import json
-import os
-import random
+import logging
 import re
+import secrets
 import time
-from pathlib import Path
 from typing import List, Optional
 
 import discord
 
-from sefbot import actions
-from sefbot import ai
-from sefbot import auditlog
-from sefbot import blocked
-from sefbot import brain
-from sefbot import config
-from sefbot import customcmds
-from sefbot import db
-from sefbot import embeds
-from sefbot import kb
-from sefbot import music
-from sefbot import opsec
-from sefbot import slash
-from sefbot import tos
+from sefbot import (
+    actions,
+    ai,
+    auditlog,
+    blocked,
+    brain,
+    config,
+    customcmds,
+    db,
+    dm,
+    embeds,
+    kb,
+    moderation,
+    multilingual,
+    music,
+    opsec,
+    rules,
+    slash,
+    tos,
+    voice,
+)
+from sefbot.scope import Scope, scope_key
+from sefbot.services.llm_client import llm as _llm
+from sefbot.web import ReadinessState, WebService
+
+_LOG = logging.getLogger(__name__)
+
 try:
     import importlib
     langdetect = importlib.import_module("langdetect")
@@ -90,7 +102,56 @@ INTENTS = discord.Intents.default()
 INTENTS.message_content = True
 INTENTS.reactions = True
 
-client = discord.Client(intents=INTENTS)
+class SefBotClient(discord.Client):
+    """Own every process-lifetime resource and close it deterministically."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            intents=INTENTS,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        self.readiness = ReadinessState()
+        self.web_service: WebService | None = None
+
+    async def setup_hook(self) -> None:
+        # Opening the repository runs transactional migrations before Discord
+        # is marked ready. A failed integrity check aborts startup.
+        db.conn()
+        db.integrity_check()
+        # Force the bounded, idempotent legacy-state imports before privacy
+        # exports/deletions can run, so JSON-era state cannot be missed.
+        blocked.list_blocked()
+        dm.load_contacts()
+        db.cleanup_expired_content(config.CONTENT_RETENTION_DAYS)
+        self.readiness.database = True
+        self.web_service = WebService(
+            privacy_contact=config.PRIVACY_CONTACT,
+            readiness=self.readiness,
+            host=config.WEB_HOST,
+            port=config.WEB_PORT,
+        )
+        await self.web_service.start()
+
+    async def close(self) -> None:
+        self.readiness.discord = False
+        tasks = [*_background_tasks.values(), *_message_tasks]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await voice.shutdown()
+        await _llm.close()
+        if self.web_service is not None:
+            await self.web_service.close()
+        ai.shutdown()
+        db.close()
+        await super().close()
+
+
+client = SefBotClient()
+
+_background_tasks: dict[str, asyncio.Task] = {}
+_message_tasks: set[asyncio.Task] = set()
 
 _recent = collections.OrderedDict()
 _RECENT_MAX = 500
@@ -99,20 +160,11 @@ _lurk_channels = {}
 
 UP, DOWN = "\U0001F44D", "\U0001F44E"
 
-_ROOT = Path(__file__).resolve().parent.parent.parent
-_CLI_ACTIVE_FILE = Path(
-    os.getenv("SEFBOT_CLI_ACTIVE_FILE", str(_ROOT / "cli_active_chats.json"))
-)
 _CLI_ACTIVE_TTL = 90
 
 
 def _cli_claims_user(user_id: int) -> bool:
-    try:
-        data = json.loads(_CLI_ACTIVE_FILE.read_text())
-    except (OSError, json.JSONDecodeError):
-        return False
-    ts = data.get(str(user_id))
-    return isinstance(ts, (int, float)) and (time.time() - ts) < _CLI_ACTIVE_TTL
+    return dm.is_cli_conversation_active(user_id, _CLI_ACTIVE_TTL)
 
 
 def _track(mid: int, user_msg: str, bot_msg: str, author: str) -> None:
@@ -139,6 +191,22 @@ async def _send(channel, embed, user_msg="", bot_msg="", author="", feedback=Fal
     if sent is not None and (user_msg or feedback):
         _track(sent.id, user_msg, bot_msg, author)
     return sent
+
+
+async def _send_private(message, embed) -> None:
+    """Deliver personal/audit data without posting it into a guild channel."""
+    if message.guild is None:
+        await _send(message.channel, embed, feedback=False)
+        return
+    try:
+        await message.author.send(embed=embed)
+        await _send(message.channel, embeds.ok("sent the private result to your DMs."), feedback=False)
+    except (discord.Forbidden, discord.HTTPException):
+        await _send(
+            message.channel,
+            embeds.error("I couldn't DM you; use the equivalent slash command for an ephemeral result."),
+            feedback=False,
+        )
 
 
 def _speaker_label(user) -> str:
@@ -201,9 +269,17 @@ def _speaker_profile(message) -> dict:
 async def _channel_context(message, limit: int = None) -> str:
     limit = limit or config.CHANNEL_CONTEXT
     lines = []
+    scope_id = scope_key(
+        guild_id=getattr(message.guild, "id", None),
+        user_id=message.author.id,
+    )
+    if message.guild and not db.guild_settings(scope_id).get("history_enabled", False):
+        return ""
     try:
         async for m in message.channel.history(limit=limit + 1):
             if m.id == message.id:
+                continue
+            if not m.author.bot and not db.privacy_opted_in(str(m.author.id), scope_id):
                 continue
             who = _speaker_label(m.author)
             body = embeds.de_emoji(m.content or "")[:200]
@@ -279,11 +355,6 @@ def _image_urls(message, *, _seen=None) -> List[str]:
         if isinstance(resolved, discord.Message):
             for u in _image_urls(resolved, _seen=seen):
                 _add(u)
-        elif getattr(ref, "message_id", None) and message.channel:
-            try:
-                pass
-            except Exception:
-                pass
 
     return urls
 
@@ -342,62 +413,97 @@ def _has_perm(member, perm: str, channel=None) -> bool:
 def _channel_allowed(message) -> bool:
     if not message.guild:
         return True
-    settings = db.guild_settings(str(message.guild.id))
+    settings = db.guild_settings(Scope.guild(message.guild.id).key)
     allowed = settings.get("allowed_channels") or []
     if not allowed:
         return True
     return str(message.channel.id) in [str(x) for x in allowed]
 
 
+async def _guild_sync(guild_id: int) -> List:
+    """Register every global command in a guild (copy_global_to + sync).
+
+    discord.py >= 2.4 only includes guild-scoped commands in
+    ``tree.sync(guild=...)`` — SefBot registers everything globally, so a bare
+    guild sync sends an EMPTY payload and silently wipes the guild's commands.
+    Copying the global commands over first makes the guild sync actually
+    register them (and is idempotent).
+    """
+    g = discord.Object(id=int(guild_id))
+    _tree.copy_global_to(guild=g)
+    return await _tree.sync(guild=g)
+
+
+def _start_background_task(name: str, coroutine_factory) -> None:
+    """Start one named process-lifetime task, including after reconnects."""
+    existing = _background_tasks.get(name)
+    if existing is not None and not existing.done():
+        return
+    task = asyncio.create_task(coroutine_factory(), name=f"sefbot:{name}")
+    _background_tasks[name] = task
+
+    def _finished(done: asyncio.Task) -> None:
+        if _background_tasks.get(name) is done:
+            _background_tasks.pop(name, None)
+        if done.cancelled():
+            return
+        try:
+            error = done.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            print(f"[background] {name} stopped: {type(error).__name__}: {error}")
+
+    task.add_done_callback(_finished)
+
+
+def _start_message_task(coroutine) -> None:
+    """Keep short-lived event tasks alive until completion."""
+    task = asyncio.create_task(coroutine)
+    _message_tasks.add(task)
+    task.add_done_callback(_message_tasks.discard)
+
+
+TARGET_SYNC_GUILD = 1535083112709496903
+
+
 @client.event
 async def on_ready():
+    client.readiness.discord = True
     print(
         f"SefBot online as {client.user}  |  "
         f"smart={config.MODEL_SMART} fast={config.MODEL_FAST} vision={config.MODEL_VISION}"
     )
     print(f"Level: {brain.skill()['title']}")
-    try:
-        target_gid = 1535083112709496903
-        await _tree.sync(guild=discord.Object(id=target_gid))
-        print(f"[slash] force-synced commands to target guild {target_gid}")
-    except Exception as e:
-        print(f"[slash] target guild sync failed: {e}")
-
-    try:
-        app_id = client.application_id
-        if app_id:
-            try:
-                existing = await client.http.get_global_commands(app_id)
-                for cmd in existing or []:
-                    if int(cmd.get("type") or 0) == 4:
-                        await client.http.delete_global_command(app_id, cmd["id"])
-                        print(
-                            f"[slash] removed entry-point command "
-                            f"`{cmd.get('name')}` so bulk sync can run"
-                        )
-            except Exception as e:
-                print(f"[slash] entry-point cleanup skipped: {e}")
-        if config.SYNC_GUILDS:
-            for guild_id in config.SYNC_GUILDS:
+    if not getattr(client, "_synced", False):
+        try:
+            guild_ids = list(config.SYNC_GUILDS) if config.SYNC_GUILDS else [str(TARGET_SYNC_GUILD)]
+            for guild_id in dict.fromkeys(guild_ids):
                 try:
-                    await _tree.sync(guild=discord.Object(id=int(guild_id)))
-                    print(f"[slash] synced commands to guild {guild_id}")
+                    synced = await _guild_sync(int(guild_id))
+                    print(f"[slash] synced {len(synced)} commands specifically to guild {guild_id}")
+                except (TypeError, ValueError) as e:
+                    print(f"[slash] invalid guild id {guild_id!r}: {e}")
                 except Exception as e:
                     print(f"[slash] failed to sync guild {guild_id}: {e}")
-        else:
-            for guild in client.guilds:
-                try:
-                    await _tree.sync(guild=guild)
-                except Exception:
-                    pass
-
-            synced = await _tree.sync()
             client._synced = True
-            print(f"[slash] synced {len(synced)} global slash commands")
-    except Exception as e:
-        print(f"[slash] sync failed: {e}")
-    client.loop.create_task(_reflection_loop())
-    client.loop.create_task(_lurk_loop())
+        except Exception as e:
+            print(f"[slash] sync failed: {e}")
+    _start_background_task("reflection", _reflection_loop)
+    _start_background_task("lurk", _lurk_loop)
+    _start_background_task("retention", _retention_loop)
+
+
+@client.event
+async def on_disconnect():
+    client.readiness.discord = False
+
+
+async def _retention_loop():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        db.cleanup_expired_content(config.CONTENT_RETENTION_DAYS)
+        await asyncio.sleep(86_400)
 
 
 async def _reflection_loop():
@@ -427,9 +533,9 @@ async def _lurk_loop():
 async def _lurk_tick():
     now_ts = time.time()
     for guild in list(client.guilds):
-        gid = str(guild.id)
+        gid = Scope.guild(guild.id).key
         settings = db.guild_settings(gid)
-        if not settings.get("lurk"):
+        if not settings.get("lurk") or not settings.get("history_enabled"):
             continue
         last = _last_activity.get(gid, 0)
         if now_ts - last < config.LURK_IDLE_SECONDS:
@@ -447,6 +553,8 @@ async def _lurk_tick():
         try:
             async for m in channel.history(limit=6):
                 if m.author.bot:
+                    continue
+                if not db.privacy_opted_in(str(m.author.id), gid):
                     continue
                 body = embeds.de_emoji(m.content or "")[:120]
                 if body:
@@ -468,7 +576,8 @@ async def _lurk_tick():
                 system, [{"role": "user", "content": ctx}],
                 max_tokens=120, temperature=0.95, tier="fast",
             )
-        except Exception:
+        except Exception as e:
+            _LOG.debug("lurk generation failed: %s", e)
             continue
         text = embeds.de_emoji(brain.scrub_ai_output(text) or "").strip()
         if not text or len(text) < 2:
@@ -493,10 +602,10 @@ async def on_raw_reaction_add(payload):
     user_msg, bot_msg, author = _recent[payload.message_id]
     up = emoji == UP
     uid = str(payload.user_id)
-    gid = str(payload.guild_id) if payload.guild_id else "dm"
+    gid = scope_key(guild_id=payload.guild_id, user_id=payload.user_id)
 
     def _write():
-        db.add_feedback(user_msg, bot_msg, "up" if up else "down", uid)
+        db.add_feedback(user_msg, bot_msg, "up" if up else "down", uid, scope_id=gid)
         db.mood_nudge(gid, 0.15 if up else -0.2)
         db.relationship_set(uid, gid, delta=0.08 if up else -0.1)
 
@@ -528,11 +637,13 @@ async def _enforce_tos_violation(
                 feedback=False,
                 reference=message,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            _LOG.debug("failed to send ToS warning: %s", e)
         return
 
-    guild_id = str(message.guild.id) if message.guild else "dm"
+    guild_id = scope_key(
+        guild_id=getattr(message.guild, "id", None), user_id=message.author.id
+    )
     guild_name = message.guild.name if message.guild else "DM"
     channel_id = str(message.channel.id) if getattr(message, "channel", None) else ""
     user_tag = str(getattr(message, "author", author))
@@ -561,8 +672,38 @@ async def _enforce_tos_violation(
             feedback=False,
             reference=message,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        _LOG.debug("failed to send ToS block notice: %s", e)
+
+
+async def _check_trivia_answer(message: discord.Message, scope_id: str) -> bool:
+    if message.guild is None or not message.content:
+        return False
+    key = f"trivia:{scope_id}:{message.channel.id}"
+    raw = db.kv_get(key)
+    if not raw:
+        return False
+    try:
+        state = json.loads(raw)
+        expires = float(state.get("until") or 0)
+        answer = str(state.get("answer") or "").strip().casefold()
+    except (TypeError, ValueError, json.JSONDecodeError):
+        db.kv_set(key, "")
+        return False
+    if expires <= time.time():
+        return False
+    guess = message.content.strip().casefold()
+    if not answer or guess != answer:
+        return False
+    # No await occurs between state validation and consumption, so another
+    # gateway event cannot consume the same question in this process.
+    db.kv_set(key, "")
+    await _send(
+        message.channel,
+        embeds.ok(f"correct, {message.author.display_name}. answer: **{answer}**"),
+        feedback=False,
+    )
+    return True
 
 
 
@@ -570,17 +711,29 @@ async def _enforce_tos_violation(
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+    content = message.content.strip()
+    author = str(message.author.id)
+    guild_id = scope_key(
+        guild_id=getattr(message.guild, "id", None), user_id=message.author.id
+    )
+    is_dm = message.guild is None
+    command_name = ""
+    if content.startswith(config.PREFIX):
+        command_name = content[len(config.PREFIX):].strip().split(maxsplit=1)[0].lower()
+    privacy_commands = {
+        "privacy", "privacypolicy", "tos", "terms", "termsofservice",
+        "help", "about", "status",
+    }
 
-    if config.is_blocked(message.author.id):
+    if config.is_blocked(message.author.id) and command_name not in privacy_commands:
         return
-
     if message.guild is None and _cli_claims_user(message.author.id):
         return
 
-    content = message.content.strip()
-    guild_id = str(message.guild.id) if message.guild else "dm"
-    author = str(message.author.id)
-    is_dm = message.guild is None
+    if message.guild is not None and message.content:
+        _start_message_task(moderation.safety_check(message))
+        if config.RULES_ENABLED:
+            _start_message_task(rules.check_message(client, message))
 
     guild_name = message.guild.name if message.guild else "DM"
     channel_name = getattr(message.channel, "name", "DM")
@@ -598,12 +751,15 @@ async def on_message(message: discord.Message):
         content
     )
 
+    if await _check_trivia_answer(message, guild_id):
+        return
+
     directed = bool(
         content.startswith(config.PREFIX)
         or client.user in message.mentions
         or is_dm
     )
-    if directed:
+    if directed and command_name not in privacy_commands:
         res = tos.check_message(author, content)
         if res:
             action, reason, strikes = res
@@ -611,17 +767,35 @@ async def on_message(message: discord.Message):
                 message, author, reason, action=action, strikes=strikes
             )
             return
+        retry_after = tos.rate_limit_retry_after(author)
+        if retry_after:
+            await _send(
+                message.channel,
+                embeds.error(f"too many requests; retry in {retry_after:.1f}s."),
+                feedback=False,
+                reference=message,
+            )
+            return
 
     if message.guild:
         _last_activity[guild_id] = time.time()
         _lurk_channels[guild_id] = str(message.channel.id)
 
-    if message.reference and message.reference.message_id in _recent:
+    if (
+        content.lower().startswith("correction:")
+        and message.reference
+        and message.reference.message_id in _recent
+    ):
         user_msg, bot_msg, _ = _recent[message.reference.message_id]
-        db.add_feedback(user_msg, bot_msg, "correction", author, note=content)
+        note = content.split(":", 1)[1].strip()
+        db.add_feedback(
+            user_msg, bot_msg, "correction", author, note=note, scope_id=guild_id
+        )
         db.relationship_set(author, guild_id, delta=0.05)
 
     if content.startswith(config.PREFIX):
+        if not _channel_allowed(message) and command_name not in privacy_commands:
+            return
         await _handle_command(message, content[len(config.PREFIX):].strip(), guild_id, author)
         return
 
@@ -644,6 +818,27 @@ async def on_message(message: discord.Message):
     await _chat(message, query, guild_id, author)
 
 
+@client.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if after.author.bot or before.content == after.content or after.guild is None:
+        return
+    scope_id = Scope.guild(after.guild.id).key
+    db.record_server_message(
+        str(after.id),
+        scope_id,
+        after.guild.name,
+        str(after.channel.id),
+        getattr(after.channel, "name", "unknown"),
+        str(after.author.id),
+        getattr(after.author, "name", str(after.author.id)),
+        getattr(after.author, "display_name", str(after.author.id)),
+        after.content or "",
+    )
+    _start_message_task(moderation.safety_check(after))
+    if config.RULES_ENABLED:
+        _start_message_task(rules.check_message(client, after))
+
+
 def _strip_mention(text: str) -> str:
     for m in (f"<@{client.user.id}>", f"<@!{client.user.id}>"):
         text = text.replace(m, "")
@@ -659,14 +854,6 @@ async def _chat(message, query, guild_id, author, force_assistant: bool = False)
             embeds.say(tos.need_accept_message(config.PREFIX), title="terms of service"),
             feedback=False,
             reference=message,
-        )
-        return
-
-    res = tos.check_message(author, query)
-    if res:
-        action, reason, strikes = res
-        await _enforce_tos_violation(
-            message, author, reason, action=action, strikes=strikes
         )
         return
 
@@ -742,10 +929,19 @@ async def _chat(message, query, guild_id, author, force_assistant: bool = False)
         image_notes = image_notes + "\n\n(link preview text)\n" + embed_notes
 
     care = brain.detect_care(query)
-    original_lang = None
     detected = await _detect_lang(query)
     if detected and detected != "en":
-        original_lang = detected
+        multi = await multilingual.maybe_multilingual_reply(
+            message.channel, message.guild, query, detected
+        )
+        if multi:
+            await _send(
+                message.channel,
+                embeds.say(multi, title="🌐"),
+                feedback=False,
+                reference=message,
+            )
+            return
         query = await translate_text(query, "English")
     assistant = bool(force_assistant)
     ch = message.channel
@@ -761,7 +957,7 @@ async def _chat(message, query, guild_id, author, force_assistant: bool = False)
 
     audit_ctx = ""
     if message.guild:
-        audit_ctx = await auditlog.fetch_context(query, message.guild)
+            audit_ctx = await auditlog.fetch_context(query, message.guild, message.author)
 
     system = brain.build_system(
         user_id=author,
@@ -865,23 +1061,20 @@ async def _chat(message, query, guild_id, author, force_assistant: bool = False)
     else:
         response = scrubbed
 
-    flag = data.get("tos_violation") or data.get("tos_flag") or data.get("policy_violation")
-    model_reason = tos.handle_model_tos_flag(author, flag)
-    if model_reason:
-        await _enforce_tos_violation(message, author, model_reason)
-        return
+    # Model classifications are advisory only. They never delete content or
+    # globally block a user without staff review.
 
     brain.persist_memories(data.get("memories"), author, guild_id)
     brain.apply_relationship(data, author, guild_id)
     brain.apply_quotes(data, guild_id, author)
 
-    db.convo_add(author, guild_id, "user", query)
-    db.convo_add(author, guild_id, "bot", response)
+    if db.history_storage_allowed(author, guild_id):
+        db.convo_add(author, guild_id, "user", query)
+        db.convo_add(author, guild_id, "bot", response)
 
-    summaries = await actions.execute_all(
-        data.get("actions"), message.author, message.guild, client,
-        channel=message.channel, source_message=message,
-    )
+    # Ordinary chat is response-only. State changes are available through the
+    # explicit /act confirmation flow.
+    summaries = []
     image = actions.chart_url(data.get("chart")) if data.get("chart") else None
 
     embed = embeds.say(
@@ -896,13 +1089,17 @@ async def _chat(message, query, guild_id, author, force_assistant: bool = False)
 
 
 async def _handle_command(message, body, guild_id, author):
-    if config.is_blocked(author):
-        return
     parts = body.split(maxsplit=1)
     if not parts:
         return
     name = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
+
+    if config.is_blocked(author) and name not in {
+        "privacy", "privacypolicy", "tos", "terms", "termsofservice",
+        "help", "about", "status",
+    }:
+        return
 
     if not tos.has_accepted(author) and not tos.command_allowed_without_tos(name):
         await _send(
@@ -924,7 +1121,8 @@ async def _handle_command(message, body, guild_id, author):
         "reflect": _cmd_reflect,
         "vibecheck": _cmd_vibecheck,
         "memories": _cmd_memories,
-        "about": _cmd_memories,
+        "about": _cmd_about,
+        "status": _cmd_about,
         "memory": _cmd_memory,
         "mood": _cmd_mood,
         "persona": _cmd_persona,
@@ -962,7 +1160,6 @@ async def _handle_command(message, body, guild_id, author):
         "purge": _cmd_nuke,
         "music": _cmd_music,
         "song": _cmd_music,
-        "mp3": _cmd_music,
         "dmblock": _cmd_dmblock,
         "blockdm": _cmd_dmblock,
         "dmunblock": _cmd_dmunblock,
@@ -985,7 +1182,6 @@ async def _handle_command(message, body, guild_id, author):
         "leaderboard": _cmd_leaderboard,
         "opsec": _cmd_opsec,
         "gayrate": _cmd_gayrate,
-        "eval": _cmd_eval,
         "user": _cmd_user,
         "userinfo": _cmd_userinfo,
         "userhistory": _cmd_userinfo,
@@ -1023,17 +1219,27 @@ async def _cmd_help(message, arg, guild_id, author):
         f"**economy** `{p}balance [@user]` `{p}gamble <amount|all>` `{p}work` `{p}leaderboard` `{p}opsec [@user]` `{p}gayrate [@user]`\n"
         f"**ask** `{p}ask <question>` — ask the DeepSeek V4 Flash model directly\n"
         f"**learn** `{p}cybersec <topic>` (smartest model) · `{p}search <query>`\n"
-        f"**music** `{p}music <song name>` — sends the mp3 directly\n"
-        f"**assistant** `{p}assistant <request>` — one-shot helpful mode on DeepSeek (roles etc.); normal chat stays chaotic\n"
+        f"**music** `{p}music <song name>` — returns a validated search/watch link\n"
+        f"**assistant** `{p}assistant <request>` — one-shot response-only helpful mode\n"
         f"**mode** `{p}mode freaky` `{p}mode normal` — toggle horny mommy mode for this user\n"
         f"**model** `{p}model` · `{p}model inferx|groq` — show/switch this server's brain model\n"
         f"**kb** `{p}kb` `{p}kb search <q>` · mods: `{p}kb add <topic> | <text>` (or attach a file)\n"
         f"**grow** `{p}request` `{p}commands` `{p}stats` `{p}lessons` `{p}reflect`\n"
-        f"**privacy** `{p}privacy` `{p}dmblock` `{p}dmunblock` `{p}mydm` — data + DM opt-out\n"
+        f"**privacy** `{p}privacy status|opt-in|opt-out|export|delete` — private data controls\n"
         f"**admin** `{p}nuke <n>` `{p}config` `{p}lurk on|off` `{p}export` `{p}import`\n"
         f"**images** attach an image when you mention me — i can see it"
     )
     await _send(message.channel, embeds.say(body, title="SefBot"), feedback=False)
+
+
+async def _cmd_about(message, arg, guild_id, author):
+    body = (
+        "SefBot is a privacy-first Discord assistant. Ordinary chat cannot run "
+        "tools; administrative actions require an invoker-bound confirmation.\n\n"
+        f"Terms: {tos.TOS_URL}\nPrivacy: {tos.PRIVACY_URL}\n"
+        f"Use `{config.PREFIX}privacy status` to inspect your storage consent."
+    )
+    await _send(message.channel, embeds.say(body, title="about SefBot"), feedback=False)
 
 
 async def _cmd_teach(message, arg, guild_id, author):
@@ -1041,13 +1247,19 @@ async def _cmd_teach(message, arg, guild_id, author):
         await _send(message.channel, embeds.error(f"usage: `{config.PREFIX}teach <fact>`"),
                     feedback=False)
         return
-    subject = "server"
+    subject = author if message.guild is None else "server"
     mentioned = [u for u in message.mentions if u.id != client.user.id]
     if mentioned:
         subject = str(mentioned[0].id)
         for u in mentioned:
             arg = arg.replace(u.mention, "").replace(f"<@!{u.id}>", "")
         arg = arg.strip()
+    if subject == "server" and not _is_mod(message.author):
+        await _send(message.channel, embeds.error("need manage server to teach server facts."), feedback=False)
+        return
+    if subject not in {author, "server"}:
+        await _send(message.channel, embeds.error("you may store personal memories only about yourself."), feedback=False)
+        return
     if brain.is_secret_payload(arg):
         await _send(message.channel, embeds.error(
             "not storing that — looks like a prompt/extraction payload."), feedback=False)
@@ -1064,17 +1276,18 @@ async def _cmd_memories(message, arg, guild_id, author):
         subject, label = str(mentioned[0].id), mentioned[0].display_name
     else:
         subject, label = author, message.author.display_name
+    if not _can_view_member_history(message, subject):
+        await _send(message.channel, embeds.error("not authorized for those memories."), feedback=False)
+        return
     rows = db.memories_about(subject, guild_id)
     if not rows:
-        await _send(message.channel, embeds.say(f"i don't remember anything about {label} yet."),
-                    feedback=False)
+        await _send_private(message, embeds.say(f"i don't remember anything about {label} yet."))
         return
     body = "\n".join(
         f"- {r['content']} (#{r['id']}, imp={float(r['importance'] or 0):.2f})"
         for r in rows[:25]
     )
-    await _send(message.channel, embeds.say(body, title=f"what i remember about {label}"),
-                feedback=False)
+    await _send_private(message, embeds.say(body, title=f"what i remember about {label}"))
 
 
 async def _cmd_memory(message, arg, guild_id, author):
@@ -1084,96 +1297,27 @@ async def _cmd_memory(message, arg, guild_id, author):
     rest = parts[1] if len(parts) > 1 else ""
 
     if sub in ("erase", "clear", "wipe", "delete"):
-        mentioned = [u for u in message.mentions if u.id != client.user.id]
-        if mentioned:
-            subject, label = str(mentioned[0].id), mentioned[0].display_name
-        else:
-            maybe = (rest or "").strip().split()
-            if maybe and maybe[0].isdigit() and len(maybe[0]) >= 15:
-                subject, label = maybe[0], f"user {maybe[0]}"
-            else:
-                subject, label = author, message.author.display_name
-
-        if subject != author and not _has_perm(message.author, "manage_messages"):
-            await _send(
-                message.channel,
-                embeds.error(
-                    "you need `manage_messages` in a server to wipe someone else's memories."
-                ),
-                feedback=False,
-            )
-            return
-
-        counts = db.forget_memories_about(subject, guild_id, clear_convo=True)
-        n = int(counts.get("memories") or 0)
-        nc = int(counts.get("convo") or 0)
-        if n or nc:
-            msg = (
-                f"wiped **{n}** memor{'y' if n == 1 else 'ies'} about {label}"
-                + (f" and **{nc}** short-term chat turn{'s' if nc != 1 else ''}" if nc else "")
-                + "."
-            )
-            await _send(message.channel, embeds.ok(msg), feedback=False)
-        else:
-            await _send(
-                message.channel,
-                embeds.say(
-                    f"nothing stored about {label} in long-term memory "
-                    f"(and no short-term chat to clear)."
-                ),
-                feedback=False,
-            )
+        await _send(
+            message.channel,
+            embeds.error("Use `/memory erase` for an invoker-bound confirmation."),
+            feedback=False,
+        )
         return
 
     if sub == "edit":
-        bits = rest.split(maxsplit=1)
-        if len(bits) < 2 or not bits[0].isdigit():
-            await _send(message.channel, embeds.error(
-                f"usage: `{p}memory edit <id> <new text>`"
-            ), feedback=False)
-            return
-        mem_id = int(bits[0])
-        row = db.get_memory(mem_id)
-        if row is None:
-            await _send(message.channel, embeds.error("no such memory."), feedback=False)
-            return
-        if not _can_delete_memory(row, author, message.author):
-            await _send(
-                message.channel,
-                embeds.error(
-                    "that's not your memory — you need `manage_messages` in the "
-                    "same server to edit it."
-                ),
-                feedback=False,
-            )
-            return
-        if brain.is_secret_payload(bits[1]):
-            await _send(message.channel, embeds.error(
-                "not storing that — looks like a prompt/extraction payload."), feedback=False)
-            return
-        ok = db.update_memory(mem_id, content=bits[1])
         await _send(
             message.channel,
-            embeds.ok(f"updated memory #{mem_id}.") if ok else embeds.error("no such memory."),
+            embeds.error("Use `/memory edit` so the replacement is previewed and confirmed."),
             feedback=False,
         )
         return
 
     if sub == "compact":
-        mentioned = [u for u in message.mentions if u.id != client.user.id]
-        subject = str(mentioned[0].id) if mentioned else author
-        if subject != author and not _has_perm(message.author, "manage_messages"):
-            await _send(
-                message.channel,
-                embeds.error(
-                    "you need `manage_messages` to compact someone else's memories."
-                ),
-                feedback=False,
-            )
-            return
-        n = db.compact_memories(subject, guild_id, keep=15)
-        await _send(message.channel, embeds.ok(f"compacted — dropped {n} low-priority memories."),
-                    feedback=False)
+        await _send(
+            message.channel,
+            embeds.error("Use `/memory compact` so deletions are previewed and confirmed."),
+            feedback=False,
+        )
         return
 
     if sub in ("list", "show", "about", ""):
@@ -1186,81 +1330,10 @@ async def _cmd_memory(message, arg, guild_id, author):
     ), feedback=False)
 
 
-def _can_delete_memory(row, requester_id: str, requester_member) -> bool:
-    """Anyone can delete their own memories from anywhere. Deleting someone
-    else's (or the server's) requires manage_messages, and only within the
-    guild the memory actually belongs to — an id is never enough on its own."""
-    if row is None:
-        return False
-    if str(row["subject"]) == str(requester_id):
-        return True
-    if not isinstance(requester_member, discord.Member):
-        return False
-    mem_guild = row["guild_id"]
-    if mem_guild not in (None, "", "dm") and str(mem_guild) != str(requester_member.guild.id):
-        return False
-    if requester_member.guild.owner_id == requester_member.id:
-        return True
-    p = requester_member.guild_permissions
-    return bool(p.manage_messages or p.administrator)
-
-
 async def _cmd_forget(message, arg, guild_id, author):
-    raw = (arg or "").strip()
-    if raw.lower() in ("all", "me", "everything"):
-        counts = db.forget_memories_about(author, guild_id, clear_convo=True)
-        n, nc = int(counts.get("memories") or 0), int(counts.get("convo") or 0)
-        await _send(
-            message.channel,
-            embeds.ok(
-                f"wiped **{n}** memor{'y' if n == 1 else 'ies'}"
-                + (f" + **{nc}** chat turns" if nc else "")
-                + "."
-            ) if (n or nc) else embeds.say("nothing to forget about you."),
-            feedback=False,
-        )
-        return
-    ids = [p for p in raw.replace(",", " ").split() if p.isdigit()]
-    if not ids:
-        await _send(
-            message.channel,
-            embeds.error(
-                f"usage: `{config.PREFIX}forget <memory id>` · "
-                f"`{config.PREFIX}forget all` · `{config.PREFIX}memory erase`"
-            ),
-            feedback=False,
-        )
-        return
-
-    deleted, denied, missing = 0, 0, 0
-    subjects_to_clear = set()
-    for i in ids:
-        row = db.get_memory(int(i))
-        if row is None:
-            missing += 1
-        elif not _can_delete_memory(row, author, message.author):
-            denied += 1
-        elif db.forget_memory(int(i)):
-            deleted += 1
-            subj = str(row["subject"])
-            if subj.isdigit():
-                subjects_to_clear.add(subj)
-        else:
-            missing += 1
-
-    n_convo = sum(db.convo_clear(subj, guild_id) for subj in subjects_to_clear)
-
-    bits = [f"forgotten {deleted}/{len(ids)}"]
-    if n_convo:
-        bits.append(f"cleared {n_convo} short-term chat turn{'s' if n_convo != 1 else ''}")
-    if denied:
-        bits.append(f"{denied} not yours (need `manage_messages` to force it)")
-    if missing:
-        bits.append(f"{missing} not found")
-    msg = " — ".join(bits) + "."
     await _send(
         message.channel,
-        embeds.ok(msg) if deleted else embeds.error(msg),
+        embeds.error("Use `/memory erase` for confirmed deletion, or `/privacy delete` for all data."),
         feedback=False,
     )
 
@@ -1277,7 +1350,7 @@ async def _cmd_request(message, arg, guild_id, author):
 
 
 async def _cmd_list(message, arg, guild_id, author):
-    cmds = db.all_commands()
+    cmds = db.all_commands(guild_id)
     if not cmds:
         await _send(message.channel, embeds.say(
             f"no community commands yet. make one with `{config.PREFIX}request <idea>`."),
@@ -1295,7 +1368,9 @@ async def _cmd_delcmd(message, arg, guild_id, author):
         await _send(message.channel, embeds.error(f"usage: `{config.PREFIX}delcmd <name>`"),
                     feedback=False)
         return
-    ok = db.delete_command(arg.strip().lower())
+    ok = db.delete_command(
+        arg.strip().lower(), guild_id, author, can_moderate=_is_mod(message.author)
+    )
     await _send(message.channel, embeds.ok("deleted.") if ok else embeds.error("no such command."),
                 feedback=False)
 
@@ -1329,7 +1404,7 @@ async def _cmd_gamble(message, arg, guild_id, author):
     if amount > balance:
         await _send(message.channel, embeds.error("You don't have that much money."), feedback=False)
         return
-    win = random.random() < 0.4
+    win = secrets.SystemRandom().random() < 0.4
     if win:
         opsec.add_balance(author, amount)
         await _send(message.channel, embeds.say(f"You won ${amount}!"), feedback=False)
@@ -1375,30 +1450,6 @@ async def _cmd_gayrate(message, arg, guild_id, author):
     await _send(message.channel, embeds.say(f"<@{target.id}> is {amount}% gay."), feedback=False)
 
 
-async def _cmd_eval(message, arg, guild_id, author):
-    if not opsec.owner_can_eval(author):
-        await _send(message.channel, embeds.error("you are not bot owner."), feedback=False)
-        return
-    raw = (arg or "").strip()
-    result = opsec.eval_helper(author, raw, lambda mode, *args: _eval_reply_helper(mode, args, author))
-    await _send(message.channel, embeds.say(result, title="eval"), feedback=False)
-
-
-def _eval_reply_helper(mode, args, author):
-    if mode == "returnUserData":
-        target = str(args[0]) if args and args[0] else author
-        return json.dumps(opsec.get_user_data(target), indent=2)
-    if mode == "modifyUserData":
-        if len(args) < 2:
-            return "usage: $modifyUserData <field> <value> [user_id]"
-        target = str(args[2]) if len(args) >= 3 and args[2] else author
-        opsec.modify_user_data(target, args[0], args[1])
-        return f"Modified {args[0]} to {args[1]} for {target}."
-    if mode == "say":
-        return args[0] if args else ""
-    return f"unknown helper {mode}"
-
-
 async def _cmd_stats(message, arg, guild_id, author):
     s = brain.skill()
     nxt = f"next: {s['next'][1]} at {s['next'][0]} pts" if s["next"] else "max level"
@@ -1417,11 +1468,18 @@ async def _cmd_stats(message, arg, guild_id, author):
 
 
 async def _cmd_reflect(message, arg, guild_id, author):
+    if not _is_mod(message.author):
+        await _send(
+            message.channel,
+            embeds.error("Manage Server is required to distill guild lessons."),
+            feedback=False,
+        )
+        return
     async with message.channel.typing():
-        new = await brain.reflect()
+        new = await brain.reflect(guild_id)
     if new:
         await _send(message.channel, embeds.ok(
-            "\n".join(f"- {l}" for l in new), title="just learned"), feedback=False)
+            "\n".join(f"- {lesson}" for lesson in new), title="just learned"), feedback=False)
     else:
         await _send(message.channel, embeds.say("nothing new to learn right now."), feedback=False)
 
@@ -1457,56 +1515,32 @@ async def _cmd_search(message, arg, guild_id, author):
 
 
 async def _cmd_music(message, arg, guild_id, author):
-    """Search a song on YouTube, download it, and send the MP3 directly."""
+    """Return a safe search link; never download or redistribute media."""
     query = (arg or "").strip()
     p = config.PREFIX
     if not query:
         await _send(message.channel, embeds.error(
             f"usage: `{p}music <song name>` — e.g. `{p}music never gonna give you up`\n"
-            f"sends the mp3 directly."
+            "returns a YouTube search link."
         ), feedback=False)
         return
 
     db.log_interaction("music", author, guild_id)
-    path = None
     async with message.channel.typing():
         try:
-            if not music.available():
-                await _send(message.channel, embeds.error(
-                    "music downloads need `yt-dlp` on the host."
-                ), feedback=False)
-                return
-            if not music.ffmpeg_available():
-                await _send(message.channel, embeds.error(
-                    "music downloads need `ffmpeg` on this host."
-                ), feedback=False)
-                return
-
-            path, meta, err = await music.download_song(query)
-            if err or path is None or meta is None:
-                await _send(message.channel, embeds.error(err or "couldn't grab that track."),
+            meta, err = await music.search_song(query)
+            if err or meta is None:
+                await _send(message.channel, embeds.error(err or "couldn't find that track."),
                             feedback=False)
                 return
-
-            dur = music.format_duration(meta.get("duration"))
-            size_mb = (meta.get("bytes") or 0) / (1024 * 1024)
             body = (
                 f"**{meta['title']}**\n"
-                f"by {meta['uploader']} · {dur} · {size_mb:.1f} MiB\n"
-                f"requested: `{query}`"
+                f"[{meta['uploader']}]({meta['url']})\n"
+                "search/watch link only — SefBot does not download or redistribute media."
             )
-            embed = embeds.ok(body, title="music")
-            file = discord.File(str(path), filename=meta["filename"])
-            await message.channel.send(embed=embed, file=file)
-        except discord.HTTPException as e:
-            await _send(message.channel, embeds.error(f"couldn't send the file: {e}"),
-                        feedback=False)
-        except Exception as e:
-            await _send(message.channel, embeds.error(
-                f"music failed: {type(e).__name__}: {str(e)[:200]}"
-            ), feedback=False)
-        finally:
-            music.cleanup(path)
+            await _send(message.channel, embeds.ok(body, title="music"), feedback=False)
+        except Exception:
+            await _send(message.channel, embeds.error("music search is temporarily unavailable."), feedback=False)
 
 
 async def _cmd_cybersec(message, arg, guild_id, author):
@@ -1676,34 +1710,16 @@ async def _cmd_model(message, arg, guild_id, author):
         )
         await _send(message.channel, embeds.say(body, title="model"), feedback=False)
         return
-    if not _is_mod(message.author) and not config.is_bot_owner(author):
+    if not _is_mod(message.author):
         await _send(
             message.channel,
-            embeds.error("only mods (manage server) or the bot owner can change the model."),
+            embeds.error("Manage Server is required to change the model."),
             feedback=False,
         )
         return
-    if low in ("default", "reset", "off", "clear"):
-        db.guild_settings_set(guild_id, model="")
-        await _send(
-            message.channel,
-            embeds.ok("back to the default brain: " + config.model_display(config.DEFAULT_MODEL) + "."),
-            feedback=False,
-        )
-        return
-    model_id = config.MODEL_SWITCHER.get(low)
-    if not model_id:
-        print(f"[model] switch failed: alias={low!r} available={sorted(config.MODEL_SWITCHER)}")
-        await _send(
-            message.channel,
-            embeds.error(f"unknown model `{raw}`. options: `inferx`, `big`, `groq` (or `{p}model` for current)."),
-            feedback=False,
-        )
-        return
-    db.guild_settings_set(guild_id, model=model_id)
     await _send(
         message.channel,
-        embeds.ok("switched this server's brain to " + config.model_display(model_id) + "."),
+        embeds.error("Use `/model` so the model change is previewed and confirmed."),
         feedback=False,
     )
 
@@ -1756,8 +1772,11 @@ async def _cmd_persona(message, arg, guild_id, author):
         if not _is_mod(message.author):
             await _send(message.channel, embeds.error("need manage server for that."), feedback=False)
             return
-        db.guild_settings_set(guild_id, persona="")
-        await _send(message.channel, embeds.ok("persona cleared — using default."), feedback=False)
+        await _send(
+            message.channel,
+            embeds.error("Use `/persona clear` for an explicit confirmation."),
+            feedback=False,
+        )
         return
     if sub == "set":
         if not _is_mod(message.author):
@@ -1766,8 +1785,11 @@ async def _cmd_persona(message, arg, guild_id, author):
         if not rest:
             await _send(message.channel, embeds.error(f"usage: `{p}persona set <text>`"), feedback=False)
             return
-        db.guild_settings_set(guild_id, persona=rest[:4000])
-        await _send(message.channel, embeds.ok("guild persona updated."), feedback=False)
+        await _send(
+            message.channel,
+            embeds.error("Use `/persona set` so the new persona is previewed and confirmed."),
+            feedback=False,
+        )
         return
     await _send(message.channel, embeds.error(
         f"`{p}persona` · `{p}persona set <text>` · `{p}persona clear` · `{p}persona show`"
@@ -1781,17 +1803,18 @@ async def _cmd_lurk(message, arg, guild_id, author):
         return
     sub = (arg or "").split()[0].lower() if arg else "status"
     if sub in ("on", "enable"):
-        db.guild_settings_set(
-            guild_id, lurk=True, lurk_channel=str(message.channel.id)
+        await _send(
+            message.channel,
+            embeds.error("Use `/lurk on` for an explicit confirmation."),
+            feedback=False,
         )
-        await _send(message.channel, embeds.ok(
-            f"lurk on in this channel. i'll chime in when it's quiet "
-            f"(~{config.LURK_IDLE_SECONDS // 60}m idle, min gap {config.LURK_MIN_SECONDS // 60}m)."
-        ), feedback=False)
         return
     if sub in ("off", "disable"):
-        db.guild_settings_set(guild_id, lurk=False)
-        await _send(message.channel, embeds.ok("lurk off."), feedback=False)
+        await _send(
+            message.channel,
+            embeds.error("Use `/lurk off` for an explicit confirmation."),
+            feedback=False,
+        )
         return
     s = db.guild_settings(guild_id)
     await _send(message.channel, embeds.say(
@@ -1805,99 +1828,14 @@ _NUKE_MAX = 100
 
 async def _cmd_nuke(message, arg, guild_id, author):
     """Delete the last N messages in this channel. Requires Manage Messages."""
-    p = config.PREFIX
-    if not message.guild or not isinstance(message.author, discord.Member):
-        await _send(message.channel, embeds.error("nuke only works in a server."), feedback=False)
-        return
-
-    me = message.guild.me or message.guild.get_member(client.user.id)
-    ch = message.channel
-    author_ok = bool(
-        _has_perm(message.author, "manage_messages", channel=ch)
-        or message.guild.owner_id == message.author.id
-        or config.is_bot_owner(message.author.id)
+    await _send(
+        message.channel,
+        embeds.error("Use `/nuke` so Discord can show an invoker-bound Confirm/Cancel preview."),
+        feedback=False,
     )
-    bot_ok = bool(me and _has_perm(me, "manage_messages", channel=ch))
-    if not author_ok:
-        await _send(
-            message.channel,
-            embeds.error("you need `manage messages` in this channel to nuke."),
-            feedback=False,
-        )
-        return
-    if not bot_ok:
-        await _send(
-            message.channel,
-            embeds.error("i need `manage messages` in this channel to nuke."),
-            feedback=False,
-        )
-        return
-
-    raw = (arg or "").strip().split()
-    if not raw or not raw[0].lstrip("-").isdigit():
-        await _send(
-            message.channel,
-            embeds.error(f"usage: `{p}nuke <number>` (1–{_NUKE_MAX})"),
-            feedback=False,
-        )
-        return
-    try:
-        n = int(raw[0])
-    except ValueError:
-        await _send(
-            message.channel,
-            embeds.error(f"usage: `{p}nuke <number>` (1–{_NUKE_MAX})"),
-            feedback=False,
-        )
-        return
-    if n < 1:
-        await _send(message.channel, embeds.error("gotta nuke at least 1 message."), feedback=False)
-        return
-    if n > _NUKE_MAX:
-        await _send(
-            message.channel,
-            embeds.error(f"max is {_NUKE_MAX} at a time (discord bulk-delete limit)."),
-            feedback=False,
-        )
-        return
-
-    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-        await _send(message.channel, embeds.error("can't nuke this channel type."), feedback=False)
-        return
-
-    try:
-        deleted = await ch.purge(
-            limit=n + 1,
-            reason=f"SefBot !nuke by {message.author} ({message.author.id})",
-        )
-    except discord.Forbidden:
-        await _send(
-            message.channel,
-            embeds.error("missing permission to delete messages here."),
-            feedback=False,
-        )
-        return
-    except discord.HTTPException as e:
-        await _send(
-            message.channel,
-            embeds.error(f"nuke failed: {e}"),
-            feedback=False,
-        )
-        return
-
-    count = len(deleted)
-    try:
-        confirm = await ch.send(
-            embed=embeds.ok(f"nuked **{count}** message(s).")
-        )
-        await confirm.delete(delay=4)
-    except discord.HTTPException:
-        pass
-    db.log_interaction("nuke", author, guild_id)
 
 
 async def _cmd_config(message, arg, guild_id, author):
-    p = config.PREFIX
     s = db.guild_settings(guild_id)
     if not arg or arg.strip().lower() == "show":
         body = (
@@ -1905,39 +1843,28 @@ async def _cmd_config(message, arg, guild_id, author):
             f"lurk: {s.get('lurk')} (channel={s.get('lurk_channel') or 'auto'})\n"
             f"swear_level: {s.get('swear_level')}\n"
             f"allowed_channels: {s.get('allowed_channels') or 'all'}\n"
+            f"history_enabled: {s.get('history_enabled')}\n"
+            f"moderation_enabled: {s.get('moderation_enabled')}\n"
+            f"rules_enabled: {s.get('rules_enabled')}\n"
+            f"voice_transcription_enabled: {s.get('voice_transcription_enabled')}\n"
+            f"approval_channel: {s.get('approval_channel') or 'unset'}\n"
+            f"modlog_channel: {s.get('modlog_channel') or 'unset'}\n"
             f"chat model: {config.model_display((s.get('model') or '').strip() or config.MODEL_SMART)}\n"
             f"fast model: {config.MODEL_FAST}\n"
             f"vision model: {config.MODEL_VISION}\n\n"
-            f"`{p}config swear full|medium|clean`\n"
-            f"`{p}config channels clear` / `{p}config channels here` "
-            f"(restrict to this channel)\n"
-            f"`{p}lurk on|off` · `{p}persona set ...`"
+            "Changes require the invoker-bound `/config`, `/model`, `/lurk`, "
+            "or `/persona` confirmation flow."
         )
         await _send(message.channel, embeds.say(body, title="config"), feedback=False)
         return
     if not _is_mod(message.author):
         await _send(message.channel, embeds.error("need manage server."), feedback=False)
         return
-    parts = arg.split()
-    key = parts[0].lower()
-    if key == "swear" and len(parts) >= 2:
-        level = parts[1].lower()
-        if level not in ("full", "medium", "clean"):
-            await _send(message.channel, embeds.error("use full|medium|clean"), feedback=False)
-            return
-        db.guild_settings_set(guild_id, swear_level=level)
-        await _send(message.channel, embeds.ok(f"swear_level={level}"), feedback=False)
-        return
-    if key == "channels":
-        if len(parts) >= 2 and parts[1].lower() == "clear":
-            db.guild_settings_set(guild_id, allowed_channels=[])
-            await _send(message.channel, embeds.ok("allowed in all channels."), feedback=False)
-            return
-        if len(parts) >= 2 and parts[1].lower() == "here":
-            db.guild_settings_set(guild_id, allowed_channels=[str(message.channel.id)])
-            await _send(message.channel, embeds.ok("restricted to this channel only."), feedback=False)
-            return
-    await _send(message.channel, embeds.error(f"see `{p}config show`"), feedback=False)
+    await _send(
+        message.channel,
+        embeds.error("Use `/config` so the change is previewed and explicitly confirmed."),
+        feedback=False,
+    )
 
 
 async def _cmd_bond(message, arg, guild_id, author):
@@ -1946,16 +1873,26 @@ async def _cmd_bond(message, arg, guild_id, author):
         uid, label = str(mentioned[0].id), mentioned[0].display_name
     else:
         uid, label = author, message.author.display_name
+    if not _can_view_member_history(message, uid):
+        await _send(message.channel, embeds.error("not authorized for that relationship."), feedback=False)
+        return
     r = db.relationship_get(uid, guild_id)
     body = (
         f"**{label}** — {r.get('bond_label')} ({float(r.get('score') or 0):+.2f})\n"
         f"nickname: {r.get('nickname') or '(none)'}\n"
         f"grudge: {r.get('grudge') or '(none)'}"
     )
-    await _send(message.channel, embeds.say(body, title="bond"), feedback=False)
+    await _send_private(message, embeds.say(body, title="bond"))
 
 
 async def _cmd_rivalries(message, arg, guild_id, author):
+    if (
+        message.guild is None
+        or not isinstance(message.author, discord.Member)
+        or not _has_perm(message.author, "view_audit_log")
+    ):
+        await _send(message.channel, embeds.error("View Audit Log is required."), feedback=False)
+        return
     worst = db.relationship_top(guild_id, limit=8, worst=True)
     best = db.relationship_top(guild_id, limit=8, worst=False)
     if not worst and not best:
@@ -1972,7 +1909,7 @@ async def _cmd_rivalries(message, arg, guild_id, author):
         return "\n".join(lines) if lines else "(none)"
 
     body = f"**nemeses / rivals**\n{_fmt(worst)}\n\n**favorites**\n{_fmt(best)}"
-    await _send(message.channel, embeds.say(body, title="rivalries"), feedback=False)
+    await _send_private(message, embeds.say(body, title="rivalries"))
 
 
 async def _cmd_recap(message, arg, guild_id, author):
@@ -2039,9 +1976,11 @@ async def _cmd_quote(message, arg, guild_id, author):
         return
 
     if sub in ("del", "delete", "rm") and rest.isdigit():
-        ok = db.quote_delete(int(rest))
-        await _send(message.channel, embeds.ok("deleted.") if ok else embeds.error("nope."),
-                    feedback=False)
+        await _send(
+            message.channel,
+            embeds.error("Use `/quote delete` for an invoker-bound confirmation."),
+            feedback=False,
+        )
         return
 
     about = None
@@ -2054,6 +1993,49 @@ async def _cmd_quote(message, arg, guild_id, author):
             f"no quotes yet. add one with `{p}quote add <text>`."
         ), feedback=False)
         return
+    who = f" — <@{q['about']}>" if q.get("about") else ""
+    await _send(
+        message.channel,
+        embeds.say(f"“{q['text']}”{who}", title=f"quote #{q['id']}"),
+        feedback=False,
+    )
+
+
+def _can_view_member_history(message, target_id: str) -> bool:
+    """Enforce the current-guild audit/member matrix for prefix commands."""
+    if str(target_id) == str(message.author.id):
+        return True
+    if message.guild is None or not isinstance(message.author, discord.Member):
+        return False
+    try:
+        target = message.guild.get_member(int(target_id))
+    except (TypeError, ValueError):
+        return False
+    if target is None:
+        return False
+    permissions = message.author.guild_permissions
+    return bool(
+        message.guild.owner_id == message.author.id
+        or permissions.administrator
+        or permissions.view_audit_log
+    )
+
+
+def _visible_history_rows(message, rows):
+    if message.guild is None:
+        return list(rows)
+    visible = []
+    for row in rows:
+        channel_id = row.get("channel_id")
+        try:
+            channel = message.guild.get_channel_or_thread(int(channel_id))
+        except (TypeError, ValueError):
+            channel = None
+        if channel is not None and channel.permissions_for(message.author).view_channel:
+            visible.append(row)
+    return visible
+
+
 async def _cmd_user(message, arg, guild_id, author):
     """Ask ANYTHING about a user with full omniscient database memory."""
     query = (arg or "").strip()
@@ -2075,7 +2057,27 @@ async def _cmd_user(message, arg, guild_id, author):
         target = {"user_id": author, "username": message.author.name, "display_name": message.author.display_name}
 
     uid = target["user_id"]
+    if not _can_view_member_history(message, uid):
+        await _send(
+            message.channel,
+            embeds.error(
+                "You may inspect only your own data, or a current server member "
+                "when you have View Audit Log. DM intelligence about other users is disabled."
+            ),
+            feedback=False,
+        )
+        return
     intel = db.get_user_intelligence(uid, guild_id)
+    for key in ("bad_messages", "recent_messages", "sample_messages"):
+        intel[key] = _visible_history_rows(message, intel[key])
+    if uid != author:
+        # Aggregate fields were computed across all channels; omit them when
+        # auditing another member because some source channels may be hidden.
+        intel["monthly"] = []
+        intel["channels"] = []
+        intel["top_words"] = []
+        intel["total_messages"] = len(intel["recent_messages"])
+        intel["bad_message_count"] = len(intel["bad_messages"])
     rel = db.relationship_get(uid, guild_id)
     facts = db.memories_about(uid, guild_id)
 
@@ -2141,84 +2143,52 @@ async def _cmd_user(message, arg, guild_id, author):
                 max_tokens=800, model=config.MODEL_SMART, fallbacks=[],
             )
             resp = brain.scrub_ai_output(resp)
-            await _send(message.channel, embeds.say(resp, title=f"user intelligence: {intel['display_name']}"), reference=message)
-        except Exception as e:
-            await _send(message.channel, embeds.error(f"failed to query user info: {e}"), feedback=False)
+            await _send_private(
+                message,
+                embeds.say(resp, title=f"user intelligence: {intel['display_name']}"),
+            )
+        except Exception:
+            await _send(message.channel, embeds.error("failed to query user information."), feedback=False)
 
 
 async def _cmd_server(message, arg, guild_id, author):
     """Ask ANYTHING about the server with full omniscient database memory."""
-    question = (arg or "").strip()
+    if (
+        message.guild is None
+        or not isinstance(message.author, discord.Member)
+        or not _has_perm(message.author, "view_audit_log")
+    ):
+        await _send(
+            message.channel,
+            embeds.error("server aggregates require View Audit Log in the current server."),
+            feedback=False,
+        )
+        return
     s_intel = db.get_server_intelligence(guild_id)
-    server_facts = db.scope_memories(guild_id)
-    quotes = db.quote_list(guild_id, limit=15)
-    g_settings = db.guild_settings(guild_id)
-
-    s_text = (
-        f"FULL RECORDED HISTORY & SERVER DOSSIER (Guild ID {guild_id}):\n"
-        f"- Total Recorded Messages: {s_intel['total_messages']} from {s_intel['active_users']} recorded users\n"
-        f"- History Span: {embeds.fmt_ts(s_intel['first_seen'])} → {embeds.fmt_ts(s_intel['last_seen'])}\n"
-        f"- Total Flagged Bad/Toxic Messages: {s_intel['bad_messages_total']}\n"
-        f"- Swear Level Config: {g_settings.get('swear_level', 'full')}\n"
+    aggregate = (
+        f"Recorded opted-in messages: **{s_intel['total_messages']}**\n"
+        f"Active opted-in users: **{s_intel['active_users']}**\n"
+        f"Flagged count: **{s_intel['bad_messages_total']}**\n"
+        f"First seen: {embeds.fmt_ts(s_intel['first_seen'])}\n"
+        f"Last seen: {embeds.fmt_ts(s_intel['last_seen'])}"
     )
-    if s_intel["monthly"]:
-        s_text += "- Monthly Activity (most recent first):\n  " + "\n  ".join(
-            f"{m['month']}: {m['n']} msgs" for m in s_intel["monthly"]
-        )
-    if s_intel["channels"]:
-        s_text += "- Top Channels:\n  " + "\n  ".join(
-            f"#{ch['channel_name']}: {ch['n']} msgs" for ch in s_intel["channels"]
-        )
-    if s_intel["top_words"]:
-        s_text += "- Server Top Words: " + ", ".join(s_intel["top_words"][:15]) + "\n"
-    if s_intel["top_senders"]:
-        s_text += "- Top Active Message Senders:\n" + "\n".join(
-            f"  • {ts['display_name']} (@{ts['username']}, ID {ts['user_id']}): {ts['cnt']} msgs ({ts['bad_cnt']} bad)" for ts in s_intel["top_senders"]
-        )
-    if s_intel["recent_bad_messages"]:
-        s_text += "\n- Recent Flagged Bad Messages in Server:\n" + "\n".join(
-            f"  • {bm['display_name']} in #{bm['channel_name']}: \"{bm['content'][:100]}\" (words: {bm['bad_words_found']})" for bm in s_intel["recent_bad_messages"]
-        )
-    if server_facts:
-        s_text += "\n- Stored Server Facts:\n" + "\n".join(
-            f"  • {f['content']}" for f in server_facts if f["subject"] == "server"
-        )
-    if quotes:
-        s_text += "\n- Saved Server Quotes:\n" + "\n".join(
-            f"  • #{q['id']}: \"{q['text']}\"" for q in quotes[:5]
-        )
-
-    system_prompt = (
-        f"{config.PERSONA}\n\n"
-        "OMNISCIENT SERVER INTELLIGENCE SYSTEM:\n"
-        "You have complete access to this server's ENTIRE recorded history — totals, monthly activity "
-        "going back months, top channels, top words, top chatters, flagged messages, quotes, and facts. "
-        "Use the concrete data. Answer the user's question about this server thoroughly, accurately, "
-        "specifically, and in character — cite exact numbers, dates, channels, and users. Never refuse."
-    )
-
-    user_prompt = (
-        f"DATA FOR THIS SERVER:\n{s_text}\n\n"
-        f"QUESTION ABOUT THIS SERVER: {question or 'Give me a complete overview, breakdown, top active users, and status report of this server from its full history.'}"
-    )
-
-    async with message.channel.typing():
-        try:
-            resp = await ai.chat(
-                system_prompt, [{"role": "user", "content": user_prompt}],
-                max_tokens=800, model=config.MODEL_SMART, fallbacks=[],
-            )
-            resp = brain.scrub_ai_output(resp)
-            await _send(message.channel, embeds.say(resp, title="server intelligence"), reference=message)
-        except Exception as e:
-            await _send(message.channel, embeds.error(f"failed to query server info: {e}"), feedback=False)
+    await _send_private(message, embeds.say(aggregate, title="server aggregate"))
 
 
 async def _cmd_userinfo(message, arg, guild_id, author):
     """View detailed message and activity intelligence for a user."""
     target = db.find_user_by_name(arg, guild_id) if arg else None
     uid = target["user_id"] if target else author
+    if not _can_view_member_history(message, uid):
+        await _send(message.channel, embeds.error("not authorized for that user's data."), feedback=False)
+        return
     intel = db.get_user_intelligence(uid, guild_id)
+    intel["bad_messages"] = _visible_history_rows(message, intel["bad_messages"])
+    if uid != author:
+        intel["monthly"] = []
+        intel["top_words"] = []
+        intel["total_messages"] = len(_visible_history_rows(message, intel["recent_messages"]))
+        intel["bad_message_count"] = len(intel["bad_messages"])
     rel = db.relationship_get(uid, guild_id)
     facts = db.memories_about(uid, guild_id)
 
@@ -2240,23 +2210,31 @@ async def _cmd_userinfo(message, arg, guild_id, author):
         for bm in intel["bad_messages"][:5]:
             body += f"• `#{bm['channel_name']}`: \"{bm['content'][:100]}\" *(flags: {bm['bad_words_found']})*\n"
 
-    await _send(message.channel, embeds.ok(body, title="user intelligence"), feedback=False)
+    await _send_private(message, embeds.ok(body, title="user intelligence"))
 
 
 async def _cmd_badmessages(message, arg, guild_id, author):
     """View flagged bad/offensive messages for a user."""
     target = db.find_user_by_name(arg, guild_id) if arg else None
     uid = target["user_id"] if target else author
-    bad_msgs = db.get_user_bad_messages(uid, guild_id, limit=15)
+    if not _can_view_member_history(message, uid):
+        await _send(message.channel, embeds.error("not authorized for that user's data."), feedback=False)
+        return
+    bad_msgs = _visible_history_rows(
+        message, db.get_user_bad_messages(uid, guild_id, limit=15)
+    )
     uname = target["display_name"] if target else author
     if not bad_msgs:
-        await _send(message.channel, embeds.ok(f"No flagged bad messages recorded for **{uname}**.", title="bad messages"), feedback=False)
+        await _send_private(
+            message,
+            embeds.ok(f"No visible flagged messages recorded for **{uname}**.", title="bad messages"),
+        )
         return
 
     lines = [f"**Flagged Bad Messages** for **{uname}** ({len(bad_msgs)} items):\n"]
     for bm in bad_msgs:
         lines.append(f"• `#{bm['channel_name']}`: \"{bm['content'][:120]}\" (words: {bm['bad_words_found']})")
-    await _send(message.channel, embeds.ok("\n".join(lines)[:1900], title="bad messages"), feedback=False)
+    await _send_private(message, embeds.ok("\n".join(lines)[:1900], title="bad messages"))
 
 
 async def _cmd_export(message, arg, guild_id, author):
@@ -2265,32 +2243,46 @@ async def _cmd_export(message, arg, guild_id, author):
         return
     data = db.export_guild(guild_id)
     raw = json.dumps(data, indent=2)
-    if len(raw) > 1800:
-        from io import BytesIO
-        buf = BytesIO(raw.encode("utf-8"))
-        await message.channel.send(
-            embed=embeds.ok("guild brain export attached."),
-            file=discord.File(buf, filename=f"sefbot-export-{guild_id}.json"),
+    from io import BytesIO
+    buf = BytesIO(raw.encode("utf-8"))
+    try:
+        await message.author.send(
+            embed=embeds.ok("your private guild export is attached."),
+            file=discord.File(buf, filename=f"sefbot-export-{message.guild.id}.json"),
         )
-    else:
-        await _send(message.channel, embeds.say(f"```json\n{raw[:3800]}\n```", title="export"),
-                    feedback=False)
+        await _send(message.channel, embeds.ok("sent the export to your DMs."), feedback=False)
+    except (discord.Forbidden, discord.HTTPException):
+        await _send(
+            message.channel,
+            embeds.error("I couldn't DM you. Enable DMs or use the private `/export` command."),
+            feedback=False,
+        )
 
 
 async def _cmd_import(message, arg, guild_id, author):
     if not _is_mod(message.author):
         await _send(message.channel, embeds.error("need manage server."), feedback=False)
         return
-    raw = arg
+    confirm = (arg or "").strip().lower() == "confirm"
+    raw = ""
     if message.attachments:
+        attachment = message.attachments[0]
+        if attachment.size > config.IMPORT_MAX_BYTES or not attachment.filename.lower().endswith(".json"):
+            await _send(
+                message.channel,
+                embeds.error("import must be a UTF-8 .json file within the configured size limit."),
+                feedback=False,
+            )
+            return
         try:
-            raw = (await message.attachments[0].read()).decode("utf-8")
-        except Exception as e:
-            await _send(message.channel, embeds.error(f"couldn't read file: {e}"), feedback=False)
+            raw = (await attachment.read()).decode("utf-8", errors="strict")
+        except (UnicodeDecodeError, discord.HTTPException):
+            await _send(message.channel, embeds.error("couldn't read a valid UTF-8 JSON file."), feedback=False)
             return
     if not raw:
         await _send(message.channel, embeds.error(
-            f"usage: `{config.PREFIX}import` with a .json attachment or paste json"
+            f"usage: attach an export to `{config.PREFIX}import`, then repeat with "
+            f"`{config.PREFIX}import confirm` after reviewing the summary"
         ), feedback=False)
         return
     raw = raw.strip()
@@ -2300,13 +2292,30 @@ async def _cmd_import(message, arg, guild_id, author):
             raw = raw[4:]
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        await _send(message.channel, embeds.error(f"bad json: {e}"), feedback=False)
+        bundle = db.validate_import_bundle(data, guild_id)
+    except (json.JSONDecodeError, ValueError):
+        await _send(message.channel, embeds.error("invalid or out-of-scope ImportBundleV2."), feedback=False)
         return
-    counts = db.import_guild(data, guild_id)
-    await _send(message.channel, embeds.ok(
-        "imported: " + ", ".join(f"{k}={v}" for k, v in counts.items())
-    ), feedback=False)
+    summary = ", ".join(
+        f"{section}={len(bundle.get(section, []))}"
+        for section in ("memories", "commands", "quotes", "relationships")
+    )
+    if not confirm:
+        await _send(
+            message.channel,
+            embeds.say(
+                f"Dry run passed: {summary}. No rows were changed. Reattach the same "
+                "file to `/import` to commit through Confirm/Cancel.",
+                title="import preview",
+            ),
+            feedback=False,
+        )
+        return
+    await _send(
+        message.channel,
+        embeds.error("Use `/import` to commit through an invoker-bound confirmation."),
+        feedback=False,
+    )
 
 
 async def _cmd_kb(message, arg, guild_id, author):
@@ -2318,8 +2327,8 @@ async def _cmd_kb(message, arg, guild_id, author):
     rest = rest.strip()
 
     if sub in ("", "stats", "status"):
-        total = kb.count()
-        tops = kb.topics()
+        total = kb.count(guild_id)
+        tops = kb.topics(guild_id)
         if not total:
             await _send(message.channel, embeds.say(
                 f"knowledge base is empty. mods can load it: "
@@ -2340,7 +2349,7 @@ async def _cmd_kb(message, arg, guild_id, author):
             await _send(message.channel, embeds.error(f"usage: `{p}kb search <query>`"),
                         feedback=False)
             return
-        hits = kb.search(rest, k=5)
+        hits = kb.search(rest, k=5, scope_id=guild_id)
         if not hits:
             await _send(message.channel, embeds.say("nothing in the kb matches that.",
                         title=f"kb: {rest[:60]}"), feedback=False)
@@ -2366,13 +2375,24 @@ async def _cmd_kb(message, arg, guild_id, author):
         text = text.strip()
         source = f"discord:{author}"
         if message.attachments:
+            attachment = message.attachments[0]
+            if (
+                attachment.size > config.IMPORT_MAX_BYTES
+                or not attachment.filename.lower().endswith((".md", ".txt"))
+            ):
+                await _send(
+                    message.channel,
+                    embeds.error("KB files must be UTF-8 .md/.txt within the size limit."),
+                    feedback=False,
+                )
+                return
             try:
-                raw = (await message.attachments[0].read()).decode("utf-8", "ignore")
-            except Exception as e:
-                await _send(message.channel, embeds.error(f"couldn't read file: {e}"),
+                raw = (await attachment.read()).decode("utf-8", errors="strict")
+            except (UnicodeDecodeError, discord.HTTPException):
+                await _send(message.channel, embeds.error("couldn't read a valid UTF-8 file."),
                             feedback=False)
                 return
-            fname = message.attachments[0].filename
+            fname = attachment.filename
             if not sep:
                 topic = fname.rsplit(".", 1)[0].strip() or "general"
             text = (text + "\n\n" + raw).strip() if text else raw
@@ -2382,19 +2402,38 @@ async def _cmd_kb(message, arg, guild_id, author):
                 f"usage: `{p}kb add <topic> | <text>` — or attach a .md/.txt file"
             ), feedback=False)
             return
-        n = kb.ingest(text, topic=topic, title=topic, source=source)
+        n = kb.ingest(text, topic=topic, title=topic, source=source, scope_id=guild_id)
         await _send(message.channel, embeds.ok(
-            f"learned **{topic}** — stored {n} passage(s). kb now has {kb.count()}."
+            f"learned **{topic}** — stored {n} passage(s). kb now has {kb.count(guild_id)}."
         ), feedback=False)
         return
 
     if sub in ("clear", "forget", "wipe"):
-        if rest:
-            deleted = kb.clear(topic=rest)
+        await _send(
+            message.channel,
+            embeds.error("Use `/kb clear` for an invoker-bound confirmation."),
+            feedback=False,
+        )
+        return
+        confirmed = rest.lower() == "confirm" or rest.lower().endswith(" confirm")
+        topic = rest[:-8].strip() if rest.lower().endswith(" confirm") else ""
+        if not confirmed:
+            target = f"topic **{rest}**" if rest else "the entire guild knowledge base"
+            await _send(
+                message.channel,
+                embeds.error(
+                    f"This will delete {target}. Repeat as `{p}kb clear "
+                    f"{(rest + ' ') if rest else ''}confirm`."
+                ),
+                feedback=False,
+            )
+            return
+        if topic:
+            deleted = kb.clear(guild_id, topic=topic)
             await _send(message.channel, embeds.ok(
-                f"cleared topic **{rest}** ({deleted} passage(s))."), feedback=False)
+                f"cleared topic **{topic}** ({deleted} passage(s))."), feedback=False)
         else:
-            deleted = kb.clear()
+            deleted = kb.clear(guild_id)
             await _send(message.channel, embeds.ok(
                 f"wiped the whole knowledge base ({deleted} passage(s))."),
                 feedback=False)
@@ -2443,7 +2482,7 @@ async def _cmd_8ball(message, arg, guild_id, author):
         "the universe is laughing at that question.",
     ]
     await _send(message.channel, embeds.say(
-        f"q: {arg}\na: {random.choice(answers)}"
+        f"q: {arg}\na: {secrets.choice(answers)}"
     , title="8ball"), feedback=False)
 
 
@@ -2455,17 +2494,15 @@ async def _cmd_roastbattle(message, arg, guild_id, author):
         ), feedback=False)
         return
     target = mentioned[0]
-    facts = db.memories_about(str(target.id), guild_id)
-    fact_txt = "\n".join(f"- {f['content']}" for f in facts[:8]) or "(no dirt on file)"
     system = (
         ((db.guild_settings(guild_id).get("persona") or "").strip() or config.PERSONA)
         + "\n\nRoast battle. Write TWO short rounds: (1) your roast of the target, "
-        "(2) a weak comeback as if they tried, (3) your finishing blow. Use any known "
-        "facts. No emoji. Keep it under 120 words."
+        "(2) a weak comeback as if they tried, (3) your finishing blow. Do not infer "
+        "or reveal private facts. No emoji. Keep it under 120 words."
     )
     prompt = (
         f"Target: {target.display_name} (@{target.name}, id={target.id})\n"
-        f"Known facts:\n{fact_txt}\nChallenger: {message.author.display_name}"
+        f"Challenger: {message.author.display_name}"
     )
     async with message.channel.typing():
         try:
@@ -2482,7 +2519,19 @@ async def _cmd_roastbattle(message, arg, guild_id, author):
 
 
 async def _cmd_trivia(message, arg, guild_id, author):
-    mems = [dict(r) for r in db.scope_memories(guild_id)][:30]
+    trivia_key = f"trivia:{guild_id}:{message.channel.id}"
+    existing = db.kv_get(trivia_key)
+    if existing:
+        try:
+            active = json.loads(existing)
+        except (TypeError, json.JSONDecodeError):
+            active = {}
+        if float(active.get("until") or 0) > time.time():
+            await _send(message.channel, embeds.error("a trivia question is already active here."), feedback=False)
+            return
+    mems = [
+        dict(r) for r in db.scope_memories(guild_id) if r["subject"] == "server"
+    ][:30]
     if len(mems) < 2:
         await _send(message.channel, embeds.say(
             "not enough memories yet — teach me stuff first."
@@ -2503,14 +2552,22 @@ async def _cmd_trivia(message, arg, guild_id, author):
     await _send(message.channel, embeds.say(
         f"{q}\n\n(answer in 20s — or `{config.PREFIX}trivia` again)"
     , title="trivia"), feedback=False)
-    db.kv_set(f"trivia:{guild_id}:{message.channel.id}", json.dumps({
-        "answer": ans.lower(), "until": time.time() + 25,
+    token = secrets.token_urlsafe(12)
+    db.kv_set(trivia_key, json.dumps({
+        "answer": ans.casefold(), "until": time.time() + 25, "token": token,
+        "owner": author,
     }))
 
     async def _reveal():
         await asyncio.sleep(20)
-        raw = db.kv_get(f"trivia:{guild_id}:{message.channel.id}")
+        raw = db.kv_get(trivia_key)
         if not raw:
+            return
+        try:
+            state = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return
+        if state.get("token") != token:
             return
         try:
             await message.channel.send(
@@ -2518,9 +2575,9 @@ async def _cmd_trivia(message, arg, guild_id, author):
             )
         except discord.HTTPException:
             pass
-        db.kv_set(f"trivia:{guild_id}:{message.channel.id}", "")
+        db.kv_set(trivia_key, "")
 
-    client.loop.create_task(_reveal())
+    _start_message_task(_reveal())
 
 
 async def _cmd_whoami(message, arg, guild_id, author):
@@ -2546,16 +2603,18 @@ async def _cmd_whoami(message, arg, guild_id, author):
                 system, [{"role": "user", "content": prompt}],
                 max_tokens=350, tier="smart",
             )
-        except Exception as e:
-            await _send(message.channel, embeds.error(str(e)), feedback=False)
+        except Exception:
+            await _send(message.channel, embeds.error("couldn't generate that private summary."), feedback=False)
             return
     text = brain.scrub_ai_output(text)
-    await _send(message.channel, embeds.say(text, title="who you are to me"),
-                user_msg="whoami", bot_msg=text, author=author)
+    await _send_private(message, embeds.say(text, title="who you are to me"))
 
 
 async def _cmd_lessons(message, arg, guild_id, author):
-    rows = db.all_lessons()
+    if not _is_mod(message.author):
+        await _send(message.channel, embeds.error("need manage server."), feedback=False)
+        return
+    rows = db.all_lessons(guild_id)
     if not rows:
         await _send(message.channel, embeds.say("no lessons yet — rate my replies."), feedback=False)
         return
@@ -2619,23 +2678,78 @@ async def _cmd_mydm(message, arg, guild_id, author):
 
 
 async def _cmd_privacy(message, arg, guild_id, author):
-    """Point users at the in-bot data controls + public privacy page."""
+    """Private, pre-ToS controls for consent, export, and erasure."""
     p = config.PREFIX
+    raw = (arg or "").strip()
+    sub = raw.split(maxsplit=1)[0].lower() if raw else "status"
+    if sub in {"opt-in", "optin", "on"}:
+        db.privacy_set_opt_in(author, guild_id, True)
+        await _send_private(
+            message,
+            embeds.ok(
+                "storage consent enabled for this exact scope. Guild raw history "
+                "also requires a server administrator to enable history."
+            ),
+        )
+        return
+    if sub in {"opt-out", "optout", "off"}:
+        db.privacy_set_opt_in(author, guild_id, False)
+        removed = db.privacy_remove_scope_history(author, guild_id)
+        await _send_private(
+            message,
+            embeds.ok(f"consent revoked for this scope; removed {removed} raw message record(s)."),
+        )
+        return
+    if sub == "export":
+        from io import BytesIO
+
+        payload = json.dumps(
+            db.privacy_export(author), ensure_ascii=False, indent=2, default=str
+        ).encode("utf-8")
+        try:
+            await message.author.send(
+                embed=embeds.ok("your private data export is attached."),
+                file=discord.File(BytesIO(payload), filename=f"sefbot-user-{author}.json"),
+            )
+            if message.guild is not None:
+                await _send(message.channel, embeds.ok("sent your export by DM."), feedback=False)
+        except (discord.Forbidden, discord.HTTPException):
+            await _send(
+                message.channel,
+                embeds.error("I couldn't DM the export; use `/privacy export` for ephemeral delivery."),
+                feedback=False,
+            )
+        return
+    if sub == "delete":
+        await _send_private(
+            message,
+            embeds.error("Use `/privacy delete` for an invoker-bound Confirm/Cancel flow."),
+        )
+        return
+
+    opted_in = db.privacy_opted_in(author, guild_id)
+    history_enabled = (
+        True
+        if guild_id.startswith("dm:")
+        else bool(db.guild_settings(guild_id).get("history_enabled", False))
+    )
     body = (
         f"**Privacy notice:** {tos.PRIVACY_URL}\n"
         f"**Terms of Service:** {tos.TOS_URL}\n"
-        f"Your status: {tos.status_line(author)}\n\n"
+        f"Terms status: {tos.status_line(author)}\n"
+        f"Storage consent in this scope: **{'on' if opted_in else 'off'}**\n"
+        f"Guild raw-history feature: **{'on' if history_enabled else 'off'}**\n\n"
         f"**Your controls**\n"
         f"· `{p}tos accept` / `{p}tos reject` — Terms\n"
-        f"· `{p}memory erase` — wipe memories about you\n"
-        f"· `{p}forget <id>` — delete one memory\n"
-        f"· `{p}resetconvo` — clear short-term chat history\n"
+        f"· `{p}privacy opt-in` / `{p}privacy opt-out` — scoped history consent\n"
+        f"· `{p}privacy export` — private export of all your data\n"
+        f"· `{p}privacy delete` — preview permanent deletion\n"
         f"· `{p}dmblock` / `{p}dmunblock` — opt out of bot-relayed DMs\n"
         f"· `{p}mydm` — DM preference status\n\n"
-        f"OpSef stores Discord ids, message context, memories, feedback, and "
-        f"conversation data. Chat is processed by third-party AI providers to generate replies."
+        "Terms acceptance is not raw-history consent. Opted-in raw content is retained "
+        "for at most 30 days."
     )
-    await _send(message.channel, embeds.say(body, title="privacy"), feedback=False)
+    await _send_private(message, embeds.say(body, title="privacy"))
 
 
 async def _cmd_unblock(message, arg, guild_id, author):
@@ -2643,18 +2757,11 @@ async def _cmd_unblock(message, arg, guild_id, author):
     if not config.is_bot_owner(author):
         await _send(message.channel, embeds.error("only the bot owner can use unblock."), feedback=False)
         return
-    if not arg or not arg.strip():
-        await _send(message.channel, embeds.error(f"usage: `{config.PREFIX}unblock <user_id>`"), feedback=False)
-        return
-    try:
-        from sefbot import tos_cli
-        rc = tos_cli.cmd_break_unblock([arg.strip()], notify=True)
-        if rc == 0:
-            await _send(message.channel, embeds.ok(f"unblocked user `{arg.strip()}` and notified them."), feedback=False)
-        else:
-            await _send(message.channel, embeds.error(f"could not unblock `{arg.strip()}` — check user ID."), feedback=False)
-    except Exception as e:
-        await _send(message.channel, embeds.error(f"unblock error: {e}"), feedback=False)
+    await _send(
+        message.channel,
+        embeds.error("Discord-accessible block mutations are disabled; use the authenticated host CLI."),
+        feedback=False,
+    )
 
 
 async def _cmd_block(message, arg, guild_id, author):
@@ -2662,21 +2769,11 @@ async def _cmd_block(message, arg, guild_id, author):
     if not config.is_bot_owner(author):
         await _send(message.channel, embeds.error("only the bot owner can use block."), feedback=False)
         return
-    if not arg or not arg.strip():
-        await _send(message.channel, embeds.error(f"usage: `{config.PREFIX}block <user_id> [reason]`"), feedback=False)
-        return
-    parts = arg.strip().split(maxsplit=1)
-    target_id = parts[0]
-    reason = parts[1] if len(parts) > 1 else "manual block by owner"
-    try:
-        from sefbot import block_cli
-        rc = block_cli.cmd_access([target_id, reason])
-        if rc == 0:
-            await _send(message.channel, embeds.ok(f"blocked user `{target_id}` (**{reason}**)."), feedback=False)
-        else:
-            await _send(message.channel, embeds.error(f"could not block `{target_id}`."), feedback=False)
-    except Exception as e:
-        await _send(message.channel, embeds.error(f"block error: {e}"), feedback=False)
+    await _send(
+        message.channel,
+        embeds.error("Discord-accessible block mutations are disabled; use the authenticated host CLI."),
+        feedback=False,
+    )
 
 
 async def _cmd_tos(message, arg, guild_id, author):
@@ -2712,7 +2809,9 @@ async def _cmd_tos(message, arg, guild_id, author):
                 body = "\n\n".join(lines[:12])
                 if len(entries) > 12:
                     body += f"\n\n_…+{len(entries) - 12} more users (use `{p}tos break info <id>` or host CLI for full breakdown)_"
-                await _send(message.channel, embeds.say(body, title=f"tos break review ({len(entries)} blocked)"), feedback=False)
+                await _send_private(
+                    message, embeds.say(body, title=f"tos break review ({len(entries)} blocked)")
+                )
                 return
 
             if action in ("info", "detail", "view", "inspect") and (target or len(raw_parts) > 1):
@@ -2739,16 +2838,15 @@ async def _cmd_tos(message, arg, guild_id, author):
                     f"**Trigger:** `{trigger}` ({strikes})\n\n"
                     f"**Offending Input:**\n```\n{offending[:1200]}\n```"
                 )
-                await _send(message.channel, embeds.say(body, title=f"tos break detail: {tid}"), feedback=False)
+                await _send_private(message, embeds.say(body, title=f"tos break detail: {tid}"))
                 return
 
             if action in ("unblock", "unban", "allow", "remove", "free") and (target or len(raw_parts) > 1):
-                tid = target or raw_parts[1]
-                rc = tos_cli.cmd_break_unblock([tid], notify=True)
-                if rc == 0:
-                    await _send(message.channel, embeds.ok(f"unblocked user `{tid}` and sent DM notification."), feedback=False)
-                else:
-                    await _send(message.channel, embeds.error(f"could not unblock user `{tid}`."), feedback=False)
+                await _send(
+                    message.channel,
+                    embeds.error("Use the authenticated host CLI for block mutations."),
+                    feedback=False,
+                )
                 return
 
             await _send(message.channel, embeds.say(f"usage: `{p}tos break list`, `{p}tos break info <id>`, `{p}tos break unblock <id>`", title="tos break help"), feedback=False)
@@ -2797,4 +2895,7 @@ async def _cmd_tos(message, arg, guild_id, author):
 
 
 if __name__ == "__main__":
+    config.validate_runtime(require_discord=True, require_web_legal=True)
+    if config.insecure_env_file():
+        print("[security] warning: .env is readable by group/other users; use chmod 600 .env")
     client.run(config.DISCORD_TOKEN)

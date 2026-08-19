@@ -1,0 +1,719 @@
+#!/usr/bin/env python3
+import argparse
+import getpass
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path, PurePosixPath
+
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_DIR = Path.home() / ".config" / "opsef-deploy"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+STATE_FILE = CONFIG_DIR / "state.json"
+PANEL_URL = "https://portal.daki.cc"
+MAX_API_RESPONSE_BYTES = 32 * 1024 * 1024
+MAX_DEPLOY_FILE_BYTES = 2 * 1024 * 1024
+_SERVER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_SECRET_RE = re.compile(
+    r"(bearer\s+|ptlc_)[A-Za-z0-9._~+/=-]+|"
+    r"(token|secret|password|api[_ -]?key)\s*[:=]\s*\S+",
+    flags=re.IGNORECASE,
+)
+_KNOWN_SERVER_STATES = frozenset({"offline", "running", "starting", "stopping"})
+_DEPLOY_ROOT_FILES = frozenset({"requirements.txt", "requirements.lock"})
+
+
+class DeployError(RuntimeError):
+    pass
+
+
+class ApiError(DeployError):
+    def __init__(self, status, message):
+        super().__init__(f"Daki API returned {status}: {message}")
+        self.status = status
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        return None
+
+
+_URL_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+class DakiClient:
+    def __init__(self, panel_url, api_key, server_id=None):
+        self.panel_url = panel_url.rstrip("/")
+        self.api_key = api_key
+        self.server_id = server_id
+
+    def request(
+        self, method, path, data=None, raw=None, timeout=60, expect_json=True
+    ):
+        if method not in {"GET", "POST"} or not path.startswith("/api/"):
+            raise DeployError("Refusing an invalid Daki API request")
+        if data is not None and raw is not None:
+            raise DeployError("Refusing an ambiguous Daki API request")
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+            "User-Agent": "opsef-deploy/1.0",
+        }
+        body = None
+        if raw is not None:
+            body = raw
+            headers["Content-Type"] = "application/octet-stream"
+        elif data is not None:
+            body = json.dumps(data).encode()
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(  # noqa: S310, RUF100 - HTTPS origin validated above
+            f"{self.panel_url}{path}", data=body, headers=headers, method=method
+        )
+        try:
+            with _URL_OPENER.open(request, timeout=timeout) as response:
+                payload = response.read(MAX_API_RESPONSE_BYTES + 1)
+                if len(payload) > MAX_API_RESPONSE_BYTES:
+                    raise DeployError("Daki returned an unexpectedly large response")
+                if not expect_json:
+                    return payload
+                if not payload:
+                    return None
+                content_type = response.headers.get("Content-Type", "")
+                if "json" not in content_type.lower():
+                    raise DeployError("Daki returned an unexpected response type")
+                try:
+                    return json.loads(payload)
+                except (json.JSONDecodeError, UnicodeDecodeError) as error:
+                    raise DeployError("Daki returned invalid JSON") from error
+        except urllib.error.HTTPError as error:
+            payload = error.read(64 * 1024)
+            message = "request failed"
+            try:
+                parsed = json.loads(payload)
+                errors = parsed.get("errors") or [] if isinstance(parsed, dict) else []
+                if errors:
+                    first = errors[0] if isinstance(errors[0], dict) else {}
+                    code = first.get("code")
+                    if isinstance(code, str) and re.fullmatch(
+                        r"[A-Za-z0-9_.-]{1,80}", code
+                    ):
+                        message = code
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
+            raise ApiError(error.code, sanitize_api_message(message)) from None
+        except (urllib.error.URLError, TimeoutError):
+            raise DeployError(
+                "Could not establish a secure connection to Daki"
+            ) from None
+
+    def server_path(self, suffix):
+        server_id = urllib.parse.quote(self.server_id, safe="")
+        return f"/api/client/servers/{server_id}{suffix}"
+
+    def ensure_directory(self, directory):
+        parent = str(directory.parent)
+        if parent == ".":
+            parent = "/"
+        elif not parent.startswith("/"):
+            parent = f"/{parent}"
+        try:
+            self.request(
+                "POST",
+                self.server_path("/files/create-folder"),
+                {"root": parent, "name": directory.name},
+            )
+        except ApiError as error:
+            if error.status not in {400, 409, 422}:
+                raise
+
+    def write_file(self, relative, contents):
+        relative = validate_relative_path(relative)
+        if len(contents) > MAX_DEPLOY_FILE_BYTES:
+            raise DeployError(f"Refusing oversized deployment file {relative}")
+        remote = f"/{relative}"
+        query = urllib.parse.urlencode({"file": remote})
+        self.request(
+            "POST",
+            self.server_path(f"/files/write?{query}"),
+            raw=contents,
+        )
+        downloaded = self.request(
+            "GET",
+            self.server_path(f"/files/contents?{query}"),
+            expect_json=False,
+        )
+        if downloaded != contents:
+            raise DeployError(f"Daki verification failed for {relative}")
+
+    def delete_file(self, relative):
+        remote = PurePosixPath(validate_relative_path(relative))
+        root = str(remote.parent)
+        if root == ".":
+            root = "/"
+        else:
+            root = f"/{root}"
+        try:
+            self.request(
+                "POST",
+                self.server_path("/files/delete"),
+                {"root": root, "files": [remote.name]},
+            )
+        except ApiError as error:
+            if error.status != 404:
+                raise
+
+    def state(self):
+        payload = self.request("GET", self.server_path("/resources"))
+        if not isinstance(payload, dict):
+            raise DeployError("Daki returned an invalid server-state response")
+        attributes = payload.get("attributes")
+        if not isinstance(attributes, dict):
+            return "unknown"
+        state = attributes.get("current_state", "unknown")
+        if not isinstance(state, str):
+            return "unknown"
+        normalized = state.strip().lower()
+        return normalized if normalized in _KNOWN_SERVER_STATES else "unknown"
+
+    def restart(self):
+        state = self.state()
+        signal = "start" if state in {"offline", "unknown"} else "restart"
+        self.request("POST", self.server_path("/power"), {"signal": signal})
+
+
+def save_json(path, value):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(CONFIG_DIR, 0o700)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=CONFIG_DIR
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def load_json(path, default):
+    try:
+        if path.is_symlink():
+            raise DeployError(f"Refusing symbolic-link deployment file {path}")
+        value = json.loads(path.read_text(encoding="utf-8"))
+        os.chmod(path, 0o600)
+        return value
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError as error:
+        raise DeployError(f"Invalid deployment file {path}: {error}") from None
+
+
+def choose_server(client, preferred=None):
+    payload = client.request("GET", "/api/client")
+    if not isinstance(payload, dict):
+        raise DeployError(
+            "Daki returned a web page instead of API data. Use "
+            "https://portal.daki.cc or a full "
+            "https://portal.daki.cc/server/... URL."
+        )
+    data = payload.get("data")
+    if not isinstance(data, list):
+        raise DeployError("Daki returned an invalid server-list response")
+    servers = []
+    for entry in data:
+        attributes = entry.get("attributes") if isinstance(entry, dict) else None
+        identifier = (
+            attributes.get("identifier") if isinstance(attributes, dict) else None
+        )
+        if isinstance(identifier, str) and _SERVER_ID_RE.fullmatch(identifier):
+            servers.append(
+                {
+                    **attributes,
+                    "name": sanitize_display_name(attributes.get("name"), identifier),
+                }
+            )
+    if not servers:
+        raise DeployError("No Daki servers are available for this API key")
+    if preferred:
+        for server in servers:
+            if server["identifier"] == preferred:
+                print(f"Using Daki server {server.get('name', server['identifier'])}")
+                return server
+    if len(servers) == 1:
+        server = servers[0]
+        print(f"Using Daki server {server.get('name', server['identifier'])}")
+        return server
+    print("Available Daki servers:")
+    for index, server in enumerate(servers, 1):
+        print(f"  {index}. {server.get('name', 'Unnamed')} ({server['identifier']})")
+    while True:
+        choice = input("Server number: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(servers):
+            return servers[int(choice) - 1]
+        print("Enter one of the listed numbers.")
+
+
+def sanitize_api_message(value):
+    if not isinstance(value, str):
+        return "request failed"
+    value = _CONTROL_RE.sub(" ", value).strip()
+    value = _SECRET_RE.sub("[redacted]", value)
+    return value[:240] or "request failed"
+
+
+def sanitize_display_name(value, fallback):
+    if not isinstance(value, str):
+        return fallback
+    value = "".join(char if char.isprintable() else " " for char in value)
+    value = " ".join(value.split())
+    value = _CONTROL_RE.sub(" ", value)
+    value = _SECRET_RE.sub("[redacted]", value).strip()
+    return value[:80] or fallback
+
+
+def validate_api_key(value):
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 4096
+        or any(not char.isprintable() or char.isspace() for char in value)
+    ):
+        raise DeployError("The saved Daki API key is invalid; run --setup")
+    return value
+
+
+def validate_relative_path(value):
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 240
+        or _CONTROL_RE.search(value)
+        or any(not char.isprintable() for char in value)
+        or "\\" in value
+    ):
+        raise DeployError("Deployment state contains an invalid file path")
+    path = PurePosixPath(value)
+    if path.is_absolute() or not path.parts or any(
+        part in {"", ".", ".."} for part in path.parts
+    ):
+        raise DeployError("Deployment state contains an unsafe file path")
+    normalized = path.as_posix()
+    if normalized != value:
+        raise DeployError("Deployment state contains a non-canonical file path")
+    return normalized
+
+
+def validate_deployable_path(value):
+    relative = validate_relative_path(value)
+    path = PurePosixPath(relative)
+    if relative in _DEPLOY_ROOT_FILES:
+        return relative
+    if len(path.parts) < 2 or path.parts[0] != "src" or path.suffix != ".py":
+        raise DeployError(f"Deployment state contains a disallowed file: {relative}")
+    return relative
+
+
+def normalize_panel(value, default_url, allow_insecure_localhost=False):
+    if not isinstance(value, str) or not isinstance(default_url, str):
+        raise DeployError("Enter a valid Daki panel URL")
+    value = value.strip()
+    if value.startswith("ptlc_"):
+        pasted_key = value
+        value = default_url
+    else:
+        pasted_key = None
+        value = value or default_url
+    if "://" not in value:
+        value = f"https://{value}"
+    parsed = urllib.parse.urlparse(value)
+    if _CONTROL_RE.search(value):
+        raise DeployError("Enter a valid Daki panel URL")
+    if not parsed.hostname or parsed.username or parsed.password:
+        raise DeployError("Enter a valid Daki panel URL")
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise DeployError("Enter a valid Daki panel port") from error
+    if port is not None and not 1 <= port <= 65_535:
+        raise DeployError("Enter a valid Daki panel port")
+    is_local = parsed.hostname.lower() in {"localhost", "127.0.0.1", "::1"}
+    if parsed.scheme != "https" and not (
+        allow_insecure_localhost and parsed.scheme == "http" and is_local
+    ):
+        raise DeployError(
+            "The Daki panel must use HTTPS (HTTP is allowed only for localhost "
+            "with --allow-insecure-localhost)"
+        )
+    if parsed.query or parsed.fragment or parsed.params:
+        raise DeployError("The Daki panel URL cannot contain query data or credentials")
+    server_id = None
+    parts = [part for part in parsed.path.split("/") if part]
+    if parts:
+        if len(parts) != 2 or parts[0] != "server":
+            raise DeployError("Use the panel origin or a /server/<identifier> URL")
+        server_id = parts[1]
+        if not _SERVER_ID_RE.fullmatch(server_id):
+            raise DeployError("The Daki server identifier is invalid")
+    return f"{parsed.scheme}://{parsed.netloc}", server_id, pasted_key
+
+
+def setup(allow_insecure_localhost=False):
+    existing = load_json(CONFIG_FILE, {})
+    if not isinstance(existing, dict):
+        raise DeployError("Saved deployment configuration must be a JSON object")
+    print("Create a Client API key at https://portal.daki.cc/account/api")
+    print("Restrict the key to trusted deployment IPs whenever the panel supports it.")
+    default_url = existing.get("panel_url") or PANEL_URL
+    entered = input(f"Daki panel or server URL [{default_url}]: ")
+    panel_url, server_id, pasted_key = normalize_panel(
+        entered, default_url, allow_insecure_localhost
+    )
+    api_key = validate_api_key(
+        pasted_key or getpass.getpass("Daki Client API key (hidden): ").strip()
+    )
+    client = DakiClient(panel_url, api_key)
+    server = choose_server(client, server_id)
+    config = {
+        "panel_url": panel_url.rstrip("/"),
+        "api_key": api_key,
+        "server_id": server["identifier"],
+        "server_name": sanitize_display_name(
+            server.get("name"), server["identifier"]
+        ),
+    }
+    save_json(CONFIG_FILE, config)
+    if STATE_FILE.exists():
+        STATE_FILE.unlink()
+    print(f"Deployment configured for {config['server_name']}.")
+    return config
+
+
+def load_config(force_setup=False, allow_insecure_localhost=False):
+    if CONFIG_DIR.is_symlink():
+        raise DeployError(
+            f"Refusing symbolic-link configuration directory {CONFIG_DIR}"
+        )
+    if CONFIG_DIR.exists():
+        os.chmod(CONFIG_DIR, 0o700)
+    if force_setup or not CONFIG_FILE.exists():
+        return setup(allow_insecure_localhost)
+    config = load_json(CONFIG_FILE, {})
+    if not isinstance(config, dict):
+        raise DeployError("Saved deployment configuration must be a JSON object")
+    required = {"panel_url", "api_key", "server_id"}
+    if not required.issubset(config):
+        return setup(allow_insecure_localhost)
+    panel_url, configured_server, _ = normalize_panel(
+        config["panel_url"], PANEL_URL, allow_insecure_localhost
+    )
+    if configured_server is not None:
+        raise DeployError("Saved panel_url must contain only the panel origin")
+    if not _SERVER_ID_RE.fullmatch(str(config["server_id"])):
+        raise DeployError("Saved Daki server identifier is invalid; run --setup")
+    config["api_key"] = validate_api_key(config["api_key"])
+    config["panel_url"] = panel_url
+    config["server_name"] = sanitize_display_name(
+        config.get("server_name"), config["server_id"]
+    )
+    return config
+
+
+def deployable_files():
+    files = []
+    source = ROOT / "src"
+    if source.exists():
+        for path in source.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.is_symlink():
+                raise DeployError(f"Refusing symbolic-link deployment file {path}")
+            if any(part == "__pycache__" for part in path.parts):
+                continue
+            if path.suffix != ".py":
+                continue
+            if path.stat().st_size > MAX_DEPLOY_FILE_BYTES:
+                raise DeployError(f"Refusing oversized deployment file {path}")
+            files.append(path)
+    for name in sorted(_DEPLOY_ROOT_FILES):
+        requirements = ROOT / name
+        if requirements.is_file():
+            if requirements.is_symlink():
+                raise DeployError(f"Refusing symbolic-link {name}")
+            if requirements.stat().st_size > MAX_DEPLOY_FILE_BYTES:
+                raise DeployError(f"Refusing oversized {name}")
+            files.append(requirements)
+    return sorted(files)
+
+
+def snapshot():
+    values = {}
+    for path in deployable_files():
+        relative = validate_deployable_path(path.relative_to(ROOT).as_posix())
+        values[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return values
+
+
+def run_checks():
+    python = ROOT / ".venv" / "bin" / "python"
+    executable = str(python) if python.is_file() else sys.executable
+    print("Running deployment checks...")
+    subprocess.run(  # noqa: S603, RUF100 - fixed local interpreter and arguments
+        [executable, "-m", "compileall", "-q", "src"], cwd=ROOT, check=True
+    )
+    if (ROOT / "tests").is_dir():
+        with tempfile.TemporaryDirectory(prefix="opsef-deploy-tests-") as directory:
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "DISCORD_TOKEN": "deployment-check-token",
+                    "PYTHONPATH": "src",
+                    "SEFBOT_DB": str(Path(directory) / "sefbot-test.db"),
+                    "SEFBOT_OWNER_ID": "",
+                    "SEFBOT_PRIVACY_CONTACT": "privacy@example.invalid",
+                    "SEFBOT_RULES_ENABLED": "0",
+                    "SEFBOT_RULES_GUILD": "",
+                    "SEFBOT_RULES_LLM_ENABLED": "0",
+                    "SEFBOT_SAFETY_ENABLED": "0",
+                    "SEFBOT_STT_ENABLED": "0",
+                    "SEFBOT_SYNC_COMMANDS": "0",
+                    "SEFBOT_SYNC_GUILDS": "",
+                }
+            )
+            subprocess.run(  # noqa: S603, RUF100 - fixed interpreter/arguments
+                [executable, "-m", "unittest", "discover", "-s", "tests", "-q"],
+                cwd=ROOT,
+                env=environment,
+                check=True,
+            )
+    ruff = ROOT / ".venv" / "bin" / "ruff"
+    if ruff.is_file():
+        subprocess.run(  # noqa: S603, RUF100 - fixed local executable and arguments
+            [str(ruff), "check", "src", "tests", "desktoppet/pet.py"],
+            cwd=ROOT,
+            check=True,
+        )
+    pip_audit = ROOT / ".venv" / "bin" / "pip-audit"
+    if pip_audit.is_file():
+        subprocess.run(  # noqa: S603, RUF100 - fixed local executable and arguments
+            [
+                str(pip_audit),
+                "--local",
+                "--skip-editable",
+                "--progress-spinner",
+                "off",
+            ],
+            cwd=ROOT,
+            check=True,
+        )
+
+
+def print_plan(changed, deleted):
+    if changed:
+        print("Files to upload:")
+        for relative in changed:
+            print(f"  {relative}")
+    if deleted:
+        print("Files to delete:")
+        for relative in deleted:
+            print(f"  {relative}")
+    if not changed and not deleted:
+        print("No deployable changes found.")
+
+
+def confirm_deployment(config, changed, deleted, restart, assume_yes=False):
+    server_id = str(config.get("server_id", ""))
+    if not _SERVER_ID_RE.fullmatch(server_id):
+        raise DeployError("The configured Daki server identifier is invalid")
+    server = sanitize_display_name(config.get("server_name"), server_id)
+    operations = []
+    if changed:
+        operations.append(f"upload {len(changed)} file(s)")
+    if deleted:
+        operations.append(f"delete {len(deleted)} remote file(s)")
+    if restart:
+        operations.append("restart the server")
+    if not operations:
+        return
+    if assume_yes:
+        return
+    if not sys.stdin.isatty():
+        raise DeployError("Non-interactive deployment requires --yes")
+    print(f"About to {', '.join(operations)} on {server} ({server_id}).")
+    confirmation = input("Type DEPLOY to continue: ").strip()
+    if confirmation != "DEPLOY":
+        raise DeployError("Deployment cancelled; no remote files were changed")
+
+
+def wait_until_running(client, timeout=180):
+    deadline = time.monotonic() + timeout
+    last_state = None
+    running_since = None
+    while time.monotonic() < deadline:
+        state = client.state()
+        if state != last_state:
+            print(f"Daki server state: {state}")
+            last_state = state
+        if state == "running":
+            if running_since is None:
+                running_since = time.monotonic()
+            elif time.monotonic() - running_since >= 6:
+                return
+        else:
+            running_since = None
+        time.sleep(2)
+    raise DeployError(f"Daki server did not remain running within {timeout} seconds")
+
+
+def deploy(args):
+    current = snapshot()
+    config = None
+    state = load_json(STATE_FILE, {})
+    if not isinstance(state, dict):
+        raise DeployError("Deployment state must be a JSON object")
+    previous = {} if args.full else state.get("files", {})
+    if not isinstance(previous, dict):
+        raise DeployError("Deployment state has an invalid files manifest")
+    previous = {
+        validate_deployable_path(relative): digest
+        for relative, digest in previous.items()
+    }
+    changed = sorted(
+        relative
+        for relative, digest in current.items()
+        if previous.get(relative) != digest
+    )
+    deleted = sorted(relative for relative in previous if relative not in current)
+    print_plan(changed, deleted)
+    if args.dry_run:
+        return
+    if not changed and not deleted and not args.restart and not args.setup:
+        return
+    if not args.skip_checks and (changed or deleted):
+        run_checks()
+    config = load_config(args.setup, args.allow_insecure_localhost)
+    if state.get("server_id") not in {None, config["server_id"]}:
+        changed = sorted(current)
+        deleted = []
+        print("The configured server changed; uploading the complete deployment set.")
+        print_plan(changed, deleted)
+    confirm_deployment(
+        config,
+        changed,
+        deleted,
+        restart=not args.no_restart,
+        assume_yes=args.yes,
+    )
+    client = DakiClient(
+        config["panel_url"], config["api_key"], config["server_id"]
+    )
+    directories = {
+        PurePosixPath(relative).parent
+        for relative in changed
+        if PurePosixPath(relative).parent != PurePosixPath(".")
+    }
+    for directory in sorted(directories, key=lambda value: len(value.parts)):
+        client.ensure_directory(directory)
+    if changed or deleted:
+        for relative in changed:
+            client.write_file(relative, (ROOT / relative).read_bytes())
+            print(f"Uploaded {relative}")
+        for relative in deleted:
+            client.delete_file(relative)
+            print(f"Deleted {relative}")
+        manifest = json.dumps(
+            {
+                "schema_version": 1,
+                "deployed_at": int(time.time()),
+                "files": current,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        client.write_file(".opsef-deploy-manifest.json", manifest)
+        print("Uploaded verified deployment manifest")
+        save_json(
+            STATE_FILE,
+            {
+                "server_id": config["server_id"],
+                "files": current,
+                "deployed_at": int(time.time()),
+            },
+        )
+    if args.no_restart:
+        if changed or deleted:
+            print("Upload complete. Daki was not restarted.")
+        else:
+            print("Configuration complete; no remote changes were made.")
+        return
+    print(f"Restarting {config.get('server_name', config['server_id'])}...")
+    client.restart()
+    wait_until_running(client)
+    print("OpSef deployed to Daki successfully.")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(prog="deploy")
+    parser.add_argument("project")
+    parser.add_argument("--setup", action="store_true")
+    parser.add_argument("--full", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--no-restart", action="store_true")
+    parser.add_argument("--restart", action="store_true")
+    parser.add_argument("--skip-checks", action="store_true")
+    parser.add_argument(
+        "--allow-insecure-localhost",
+        action="store_true",
+        help="allow an HTTP panel only when it resolves to localhost",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="confirm remote writes, deletions, and restart (for trusted CI only)",
+    )
+    args = parser.parse_args()
+    if args.project.lower() != "opsef":
+        parser.error(f"unknown project: {args.project}")
+    if args.no_restart and args.restart:
+        parser.error("--no-restart and --restart cannot be combined")
+    if args.skip_checks and not args.yes:
+        parser.error("--skip-checks requires --yes")
+    return args
+
+
+def main():
+    try:
+        deploy(parse_args())
+    except subprocess.CalledProcessError as error:
+        print(
+            f"Deployment checks failed with exit code {error.returncode}.",
+            file=sys.stderr,
+        )
+        return 1
+    except (DeployError, KeyboardInterrupt) as error:
+        message = str(error) or "Deployment cancelled"
+        print(message, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

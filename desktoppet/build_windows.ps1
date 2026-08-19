@@ -1,4 +1,3 @@
-# Build SefPet as a Windows .exe (single file).
 param([switch]$NoInstall)
 
 $ErrorActionPreference = "Stop"

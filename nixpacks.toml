@@ -1,3 +1,5 @@
 [phases.setup]
-nixPkgs = ["python3", "gcc", "ffmpeg"]
+nixPkgs = ["python314", "gcc", "ffmpeg"]
 
+[phases.install]
+cmds = ["python -m pip install --require-hashes -r requirements.lock"]

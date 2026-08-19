@@ -1,7 +1,7 @@
 """OpSef Terms of Service — acceptance gate + violation detection.
 
 Canonical page:
-  https://wearegays.net/opsef-tos.html
+  https://kozzyx.org/sefbot/terms
 
 Users must `!tos accept` (current version) before normal bot use.
 Clear ToS violations warn first; after TOS_STRIKE_LIMIT strikes the user is
@@ -9,21 +9,25 @@ hard-blocked via blocked.py.
 """
 from __future__ import annotations
 
+import collections
+import hashlib
 import re
+import threading
 import time
 from typing import Optional, Tuple
 
-from sefbot import config
-from sefbot import db
+from sefbot import config, db
+from sefbot.web import LEGAL_VERSION, PRIVACY_URL, TERMS_URL
 
-TOS_VERSION = "1.0"
-TOS_URL = "https://wearegays.net/opsef-tos.html"
-PRIVACY_URL = "https://wearegays.net/opsef-privacy.html"
+TOS_VERSION = LEGAL_VERSION
+TOS_URL = TERMS_URL
 
 TOS_STRIKE_LIMIT = 3
 _LEAK_STRIKE_LIMIT = 3
-_SPAM_WINDOW_SEC = 20.0
-_SPAM_MAX = 12
+_RATE_WINDOW_SEC = 20.0
+_RATE_MAX = 8
+_rate_buckets: dict[str, collections.deque[float]] = {}
+_rate_lock = threading.Lock()
 
 TOS_ALLOWED_COMMANDS = frozenset({
     "tos", "terms", "termsofservice",
@@ -78,9 +82,6 @@ _MALWARE_RE = re.compile(
     r"spread\s+(?:this\s+)?(?:malware|virus|trojan)\s+on\s+discord"
     r")"
 )
-
-_SPAM_RE = re.compile(r"(.)\1{40,}")
-
 
 def _uid(user_id) -> str:
     return str(user_id or "").strip()
@@ -171,27 +172,24 @@ def note_leak_attempt(user_id) -> Tuple[bool, int]:
     return n >= _LEAK_STRIKE_LIMIT, n
 
 
-def note_message_for_spam(user_id) -> bool:
-    """Track rapid-fire messages; True if over spam threshold (should block)."""
+def rate_limit_retry_after(user_id) -> float:
+    """Return a normal retry delay without creating ToS strikes or blocks."""
     uid = _uid(user_id)
     if config.is_bot_owner(uid):
-        return False
-    now = time.time()
-    raw = db.user_flag_get(uid, "tos_spam_bucket") or ""
-    times = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            t = float(part)
-        except ValueError:
-            continue
-        if now - t <= _SPAM_WINDOW_SEC:
-            times.append(t)
-    times.append(now)
-    db.user_flag_set(uid, "tos_spam_bucket", ",".join(f"{t:.3f}" for t in times[-30:]))
-    return len(times) > _SPAM_MAX
+        return 0.0
+    now = time.monotonic()
+    with _rate_lock:
+        bucket = _rate_buckets.setdefault(uid, collections.deque())
+        while bucket and now - bucket[0] >= _RATE_WINDOW_SEC:
+            bucket.popleft()
+        if len(bucket) >= _RATE_MAX:
+            return max(0.1, _RATE_WINDOW_SEC - (now - bucket[0]))
+        bucket.append(now)
+        if len(_rate_buckets) > 10_000:
+            stale = [key for key, values in _rate_buckets.items() if not values or now - values[-1] >= _RATE_WINDOW_SEC]
+            for key in stale:
+                _rate_buckets.pop(key, None)
+        return 0.0
 
 
 def _infer_category(reason: str, explicit_category: str = "") -> str:
@@ -238,13 +236,18 @@ def hard_block(
 
     db.user_flag_set(uid, "tos_emergency_block", "1")
 
+    raw = (offending_text or "").encode("utf-8", errors="replace")
+    evidence = ""
+    if raw:
+        evidence = f"sha256:{hashlib.sha256(raw).hexdigest()[:16]} length:{len(raw)}"
+
     try:
         from sefbot import blocked
         return blocked.block_user(
             uid,
             reason=tos_reason[:250],
             category=cat,
-            offending_text=offending_text,
+            offending_text=evidence,
             channel_id=channel_id,
             guild_id=guild_id,
             guild_name=guild_name,
@@ -259,6 +262,20 @@ def hard_block(
 
 def is_emergency_blocked(user_id) -> bool:
     return db.user_flag_get(_uid(user_id), "tos_emergency_block") == "1"
+
+
+def clear_block_state(user_id) -> None:
+    """Clear only ToS-created flags; manual/static blocks are untouched."""
+    uid = _uid(user_id)
+    for key, value in (
+        ("tos_emergency_block", ""),
+        ("tos_leak_strikes", "0"),
+        ("tos_violation_strikes", "0"),
+        ("tos_spam_strikes", "0"),
+        ("tos_model_strikes", "0"),
+        ("tos_spam_bucket", ""),
+    ):
+        db.user_flag_set(uid, key, value)
 
 
 def check_message(user_id, text: str):
@@ -280,14 +297,6 @@ def check_message(user_id, text: str):
         n = _strike(uid, "tos_violation_strikes")
         action = "block" if n >= TOS_STRIKE_LIMIT else "warn"
         return action, reason, n
-
-    if text and _SPAM_RE.search(text):
-        n = _strike(uid, "tos_spam_strikes")
-        if n >= 5:
-            return "block", "repeated spam content", n
-
-    if note_message_for_spam(uid):
-        return "block", "spam / abuse flood", 1
 
     return None
 
@@ -319,4 +328,3 @@ def handle_model_tos_flag(user_id, flag) -> Optional[str]:
 
 def page_footer() -> str:
     return f"ToS v{TOS_VERSION}: {TOS_URL}"
-

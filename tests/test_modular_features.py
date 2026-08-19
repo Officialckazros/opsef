@@ -1,0 +1,156 @@
+"""Regression tests for the modular moderation, vision, and slash helpers."""
+import os
+import types
+import unittest
+from unittest import mock
+
+os.environ.setdefault("DISCORD_TOKEN", "test-token")
+
+from sefbot import rules, slash, voice
+from sefbot.services.llm_client import (
+    _extract_json,
+    _validate_download_url,
+    coerce_bool,
+    sniff_image_mime,
+)
+
+
+class LlmClientHelpersTest(unittest.IsolatedAsyncioTestCase):
+    def test_extract_json_accepts_fenced_model_output(self):
+        self.assertEqual(_extract_json('```json\n{"ok": true}\n```'), {"ok": True})
+
+    def test_sniff_image_mime_uses_bytes_not_filename(self):
+        self.assertEqual(sniff_image_mime(b"\x89PNG\r\n\x1a\nrest"), "image/png")
+        self.assertEqual(sniff_image_mime(b"GIF89arest"), "image/gif")
+        self.assertIsNone(sniff_image_mime(b"<html>not an image</html>"))
+
+    def test_string_false_is_not_treated_as_true(self):
+        self.assertFalse(coerce_bool("false"))
+        self.assertFalse(coerce_bool("0"))
+        self.assertTrue(coerce_bool("true"))
+
+    async def test_download_url_rejects_private_and_non_http_targets(self):
+        for url in (
+            "http://127.0.0.1/image.png",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/image.png",
+            "file:///etc/passwd",
+            "https://user:password@example.com/image.png",
+            "https://example.com:8443/image.png",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(await _validate_download_url(url))
+
+
+class RulesRegressionTest(unittest.TestCase):
+    def test_warn_limit_escalates_from_kick_to_repeat_ban(self):
+        rule = rules.Rule(
+            "test_warn", "warn", "warn", "Test", "Test detail", warn_limit=2
+        )
+        self.assertEqual(rules._resolve_action(rule, 0, False)[0], "warn")
+        self.assertEqual(rules._resolve_action(rule, 1, False)[0], "kick")
+        self.assertEqual(rules._resolve_action(rule, 2, True)[0], "ban")
+
+    def test_pending_action_carries_rule_detail_for_warning_dm(self):
+        pending = rules.PendingAction(
+            guild_id=1,
+            rule_id="spam",
+            rule_name="Spam",
+            rule_detail="Do not repeat messages.",
+            category="warn",
+            action_label="warn",
+            offender_id=2,
+            offender_tag="user",
+            evidence="same text",
+            channel_id=3,
+            message_id=4,
+            strikes=0,
+            warn_limit=3,
+            timeout_minutes=0,
+        )
+        self.assertEqual(pending.rule_detail, "Do not repeat messages.")
+
+    def test_kys_reply_to_bot_is_exempt(self):
+        class FakeDiscordMessage:
+            pass
+
+        bot_user = types.SimpleNamespace(id=99)
+        replied = FakeDiscordMessage()
+        replied.author = bot_user
+        message = FakeDiscordMessage()
+        message.content = "kys"
+        message.mentions = []
+        message.author = types.SimpleNamespace(
+            id=1, name="member", display_name="member"
+        )
+        message.reference = types.SimpleNamespace(resolved=replied)
+        client = types.SimpleNamespace(user=bot_user)
+        with mock.patch.object(rules.discord, "Message", FakeDiscordMessage):
+            self.assertIsNone(rules.detect_rule(client, message))
+
+
+class CooldownRegressionTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        slash._last_uses.clear()
+
+    async def test_cooldown_honors_rate_and_isolated_commands(self):
+        calls = []
+
+        class Response:
+            def __init__(self):
+                self.messages = []
+
+            async def send_message(self, **kwargs):
+                self.messages.append(kwargs)
+
+        interaction = types.SimpleNamespace(
+            user=types.SimpleNamespace(id=7), response=Response()
+        )
+
+        @slash._cooldown(2, 60)
+        async def first(interaction):
+            calls.append("first")
+
+        @slash._cooldown(1, 60)
+        async def second(interaction):
+            calls.append("second")
+
+        await first(interaction)
+        await first(interaction)
+        await first(interaction)
+        await second(interaction)
+
+        self.assertEqual(calls, ["first", "first", "second"])
+        self.assertEqual(len(interaction.response.messages), 1)
+
+
+class VoiceControlRegressionTest(unittest.TestCase):
+    def test_voice_control_requires_same_channel_or_manager(self):
+        class FakeMember:
+            def __init__(self, channel_id, *, manage=False):
+                self.voice = types.SimpleNamespace(
+                    channel=types.SimpleNamespace(id=channel_id)
+                )
+                self.guild_permissions = types.SimpleNamespace(
+                    administrator=False, manage_guild=manage
+                )
+
+        target = types.SimpleNamespace(id=10)
+        with mock.patch.object(voice.discord, "Member", FakeMember):
+            same = types.SimpleNamespace(user=FakeMember(10))
+            different = types.SimpleNamespace(user=FakeMember(11))
+            manager = types.SimpleNamespace(user=FakeMember(11, manage=True))
+            self.assertTrue(voice._can_control_channel(same, target))
+            self.assertFalse(voice._can_control_channel(different, target))
+            self.assertTrue(voice._can_control_channel(manager, target))
+
+    def test_stt_queue_is_bounded(self):
+        session = voice.SttSession(1, types.SimpleNamespace())
+        with mock.patch.object(voice.log, "warning"):
+            for index in range(20):
+                session.enqueue(index, b"wav", 500.0)
+        self.assertEqual(session.queue.qsize(), 16)
+
+
+if __name__ == "__main__":
+    unittest.main()

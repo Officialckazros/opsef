@@ -13,12 +13,12 @@ Also accepted forms:
 """
 from __future__ import annotations
 
+import os
 import sys
-import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from sefbot import blocked
-
 
 HELP = """\
 SefBot hard-block CLI
@@ -59,10 +59,7 @@ def cmd_access(args: list[str]) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    import os
-    from pathlib import Path
-
-    owner = (os.getenv("SEFBOT_OWNER_ID") or "1172433512364769342").strip()
+    owner = (os.getenv("SEFBOT_OWNER_ID") or "").strip()
     env_path = Path(__file__).resolve().parent.parent.parent / ".env"
     if env_path.exists():
         try:
@@ -71,8 +68,11 @@ def cmd_access(args: list[str]) -> int:
                 if line.startswith("SEFBOT_OWNER_ID="):
                     owner = line.split("=", 1)[1].strip().strip('"').strip("'") or owner
                     break
-        except OSError:
-            pass
+        except OSError as exc:
+            print(
+                f"warning: could not read owner configuration ({type(exc).__name__})",
+                file=sys.stderr,
+            )
 
     if uid == owner:
         print("error: refusing to block the bot owner", file=sys.stderr)
@@ -87,7 +87,7 @@ def cmd_access(args: list[str]) -> int:
     if newly:
         print(f"blocked access for user {uid}")
         print("  they can no longer interact with the bot in any way")
-        print(f"  file: {blocked.BLOCKED_FILE}")
+        print("  state: committed to SQLite")
     else:
         print(f"user {uid} was already blocked (updated metadata)")
     if reason:
@@ -105,18 +105,16 @@ def cmd_unblock(args: list[str]) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    ok = blocked.unblock_user(uid)
-    try:
-        from sefbot import tos_cli
-        tos_cli._clear_tos_side_effects(uid)
-    except Exception:
-        pass
+    ok = blocked.unblock_user(uid, expected_source="manual")
 
     if ok:
         print(f"unblocked user {uid}")
         return 0
-    print(f"user {uid} was not on the live block list (cleared any temporary flags)")
-    return 0
+    print(
+        f"user {uid} has no removable manual block; ToS blocks require the ToS review CLI",
+        file=sys.stderr,
+    )
+    return 1
 
 
 
@@ -124,7 +122,7 @@ def cmd_list(_args: list[str]) -> int:
     entries = blocked.list_blocked()
     if not entries:
         print("no live-blocked users")
-        print(f"(file: {blocked.BLOCKED_FILE})")
+        print("(SQLite block state is empty)")
         return 0
     print(f"{len(entries)} live-blocked user(s):")
     for uid, meta in sorted(entries.items()):

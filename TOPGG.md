@@ -8,7 +8,7 @@ Official bot rules: https://support.top.gg/hc/en-us/articles/23146912808988-Disc
 
 | Risk | Top.gg rule | What we did |
 |------|-------------|-------------|
-| YouTube → MP3 downloads | No distributing copyrighted material without a license | `!music` / `/music` download and attach MP3s. Operator's call on listing risk. |
+| Music lookup | Avoid redistributing copyrighted media | `!music` / `/music` return validated YouTube search/watch links and metadata only. |
 | `dm_user` action | DMs must name the author (or say anonymous) **and** have opt-out | Relayed DMs now attribute the requester; `!dmblock` / `!dmunblock` / `!mydm` |
 | Thin privacy page | Honest data disclosure (Discord + good practice) | Expanded ToS/Privacy at `/sefbot` (age 13+, third-party AI, retention, controls) |
 | Drugs / crime facilitation | No depicting/facilitating sale of controlled substances | Persona hard limits: no sourcing/selling drugs; no real crime help |
@@ -30,7 +30,7 @@ Official bot rules: https://support.top.gg/hc/en-us/articles/23146912808988-Disc
    - Prefix `!` · mention the bot or DM to chat · `!help` for commands  
    - AI needs a working API key env on the host  
    - DM opt-out: `!dmblock`  
-   - Music downloads the track and sends it as an mp3
+   - Music returns a validated YouTube link; it never downloads or attaches audio
 
 ## Page content rules (Top.gg bot page)
 
@@ -54,7 +54,7 @@ Chaotic AI Discord bot that learns from your server — memory, mood, custom com
 - How to invite / get started (`@SefBot` or DM, `!help`)
 - Command overview
 - Privacy link + `!privacy` / `!dmblock`
-- That music sends MP3 downloads
+- That music returns links and metadata only
 - That responses are AI-generated and can be wrong/rude
 - Support server invite (if you have one, non-expiring)
 

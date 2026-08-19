@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from sefbot import blocked
+from sefbot.web import TERMS_URL
 
 HELP = """\
 OpSef ToS break review CLI
@@ -42,7 +43,7 @@ UNBLOCK_DM = (
     "You've been **unblocked** from OpSef.\n"
     "You can use the bot again.\n\n"
     "Please stay within the Terms of Service:\n"
-    "https://wearegays.net/opsef-tos.html"
+    f"{TERMS_URL}"
 )
 
 
@@ -62,25 +63,30 @@ def _is_tos_reason(reason: str) -> bool:
     return r.startswith("tos:") or r.startswith("tos ")
 
 
-def _discord_token() -> str:
-    """Load DISCORD_TOKEN without importing full config (avoids requiring AI keys)."""
+def _load_local_env() -> None:
+    """Load the repository's explicit operator config without using the CWD."""
     try:
         from dotenv import load_dotenv
-
+    except ImportError:
+        return
+    try:
         load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
-    except Exception:
-        pass
+    except Exception as exc:
+        print(
+            f"[warn] could not load local environment ({type(exc).__name__})",
+            file=sys.stderr,
+        )
+
+
+def _discord_token() -> str:
+    """Load DISCORD_TOKEN without importing full config (avoids requiring AI keys)."""
+    _load_local_env()
     return (os.getenv("DISCORD_TOKEN") or "").strip()
 
 
 def _db_path() -> Path:
     """Resolve sefbot.db without importing config (config needs AI keys + dotenv)."""
-    try:
-        from dotenv import load_dotenv
-
-        load_dotenv(Path(__file__).resolve().parent.parent.parent / ".env")
-    except Exception:
-        pass
+    _load_local_env()
     raw = (os.getenv("SEFBOT_DB") or "").strip()
     if raw:
         p = Path(raw)
@@ -135,7 +141,7 @@ def _kv_set(key: str, value: str) -> None:
 
 
 def _collect_emergency_blocks() -> Dict[str, dict]:
-    """Users flagged tos_emergency_block=1 in sqlite (fallback when JSON write failed)."""
+    """Read legacy emergency flags retained in SQLite for compatibility."""
     out: Dict[str, dict] = {}
     for key, _val in _kv_rows("uf:%:tos_emergency_block", "1"):
         parts = key.split(":")
@@ -146,7 +152,7 @@ def _collect_emergency_blocks() -> Dict[str, dict]:
             continue
         out[uid] = {
             "blocked_at": None,
-            "reason": "tos: emergency flag (JSON block failed)",
+            "reason": "tos: legacy emergency flag",
             "source": "emergency",
         }
     return out
@@ -157,8 +163,8 @@ def collect_tos_blocks() -> List[Tuple[str, dict]]:
     Return sorted list of (user_id, meta) for every ToS hard-block.
 
     Sources:
-      1. blocked_users.json entries with reason starting with "tos:"
-      2. sqlite emergency flags
+      1. Transactional SQLite dynamic-block records marked as ToS enforcement
+      2. Legacy SQLite emergency flags
     """
     found: Dict[str, dict] = {}
 
@@ -168,7 +174,7 @@ def collect_tos_blocks() -> List[Tuple[str, dict]]:
         if not _is_tos_reason(reason):
             continue
         entry = dict(meta)
-        entry.setdefault("source", "json")
+        entry.setdefault("source", "sqlite")
         found[str(uid)] = entry
 
     for uid, meta in _collect_emergency_blocks().items():
@@ -183,14 +189,14 @@ def collect_tos_blocks() -> List[Tuple[str, dict]]:
 def print_list(entries: List[Tuple[str, dict]], numbered: bool = True) -> None:
     if not entries:
         print("no ToS-blocked users")
-        print(f"(file: {blocked.BLOCKED_FILE})")
+        print("(SQLite block state is empty)")
         return
     print(f"{len(entries)} ToS-blocked user(s):\n")
     for i, (uid, meta) in enumerate(entries, 1):
         meta = meta if isinstance(meta, dict) else {}
         reason = (meta.get("reason") or "").strip() or "(no reason recorded)"
         when = _fmt_ts(meta.get("blocked_at"))
-        src = meta.get("source") or "json"
+        src = meta.get("source") or "sqlite"
         cat = meta.get("category") or "general"
         user_tag = meta.get("user_tag") or ""
         offending = (meta.get("offending_text") or "").strip()
@@ -221,13 +227,13 @@ def print_list(entries: List[Tuple[str, dict]], numbered: bool = True) -> None:
             print(f"       trigger:  {trigger or '—'}" + (f" ({strikes})" if strikes else ""))
         if offending:
             lines = offending.splitlines()
-            print(f"       OFFENDING TEXT:")
-            print(f"         ┌──────────────────────────────────────────────────────────")
+            print("       OFFENDING EVIDENCE:")
+            print("         ┌──────────────────────────────────────────────────────────")
             for line in lines[:8]:
                 print(f"         │ {line}")
             if len(lines) > 8:
                 print(f"         │ … ({len(lines) - 8} more lines)")
-            print(f"         └──────────────────────────────────────────────────────────")
+            print("         └──────────────────────────────────────────────────────────")
         if isinstance(history, list) and len(history) > 1:
             print(f"       history:  {len(history)} violation events recorded")
         print()
@@ -239,6 +245,7 @@ def _clear_tos_side_effects(uid: str) -> None:
     _kv_set(f"uf:{uid}:tos_emergency_block", "")
     for key, val in (
         ("tos_leak_strikes", "0"),
+        ("tos_violation_strikes", "0"),
         ("tos_spam_strikes", "0"),
         ("tos_model_strikes", "0"),
         ("tos_spam_bucket", ""),
@@ -325,33 +332,69 @@ def unblock_users(uids: List[str], *, notify: bool = True) -> int:
         print("nothing to unblock")
         return 0
 
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        print(
+            "error: synchronous CLI unblock cannot run inside an active event loop; "
+            "use the host CLI or an async bot service",
+            file=sys.stderr,
+        )
+        return 1
+
     unblocked: List[str] = []
+    failures = 0
+    emergency_ids = set(_collect_emergency_blocks())
     for uid_raw in uids:
         try:
             uid = blocked.normalize_user_id(uid_raw)
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)
+            failures += 1
             continue
 
-        removed_json = blocked.unblock_user(uid)
+        meta = blocked.get_blocked_user(uid)
+        if meta is not None and not _is_tos_reason(str(meta.get("reason") or "")):
+            print(
+                f"refusing to remove non-ToS/manual block for {uid}", file=sys.stderr
+            )
+            failures += 1
+            continue
+        if meta is None and uid not in emergency_ids:
+            print(f"user {uid} has no ToS block", file=sys.stderr)
+            failures += 1
+            continue
+
+        removed_block = (
+            blocked.unblock_user(uid, expected_source="tos") if meta is not None else False
+        )
+        if meta is not None and not removed_block:
+            print(
+                f"refusing to remove block for {uid}: its source changed concurrently",
+                file=sys.stderr,
+            )
+            failures += 1
+            continue
         _clear_tos_side_effects(uid)
-        if removed_json:
-            print(f"unblocked {uid} (removed from {blocked.BLOCKED_FILE.name})")
+        if removed_block:
+            print(f"unblocked {uid} (removed from SQLite block state)")
         else:
-            print(f"cleared ToS flags for {uid} (was not on live JSON list, or already gone)")
+            print(f"cleared emergency ToS flags for {uid}")
         unblocked.append(uid)
 
     if not unblocked:
-        return 1
+        return max(1, failures)
 
     if not notify:
         print("(skipped DM notify — --no-dm)")
-        return 0
+        return failures
 
     token = _discord_token()
     if not token:
         print("warn: no DISCORD_TOKEN — unblocked, but could not DM users", file=sys.stderr)
-        return 0
+        return failures + len(unblocked)
 
     print(f"notifying {len(unblocked)} user(s)…")
     try:
@@ -362,7 +405,9 @@ def unblock_users(uids: List[str], *, notify: bool = True) -> int:
     for uid, ok, detail in results:
         mark = "ok" if ok else "fail"
         print(f"  [{mark}] {uid}: {detail}")
-    return 0
+        if not ok:
+            failures += 1
+    return failures
 
 
 def cmd_break_info(args: list[str]) -> int:

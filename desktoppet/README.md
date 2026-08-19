@@ -17,14 +17,14 @@ wants to play, and generally tries to be a good little creature.
 - **Interactions** — click (boop!), double-click (headpats), right-click for a full menu
 - **Mini-features** — jokes, facts, math, the time, coin flips, dice, rock-paper-scissors, singing, dancing (zoomies), feeding, sleeping
 - **System tray** — hide it to the tray, feed it or quit from there
-- **Settings** — name, voice pace, toggles for TTS / AI / walking / always-on-top; persisted to `~/.sefpet/config.json`
-- **Custom sprite** — drop your own `desktoppet.png` / `desktoppet.jpg` next to the app
+- **Settings** — name, voice pace, toggles for TTS / AI / walking / always-on-top; atomically persisted to `~/.sefpet/config.json` with private permissions
+- **Custom sprite** — place a bounded PNG/JPEG named `desktoppet.png` or `desktoppet.jpg` in `~/.sefpet/sprites/`
 - **Cross-platform** — Windows (exe), macOS (app), Linux
 
 ## Quick start (from source)
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python pet.py
 ```
@@ -32,17 +32,53 @@ python pet.py
 ## AI brain
 
 SefPet uses an OpenAI-compatible API when a key is present (falls back to the
-offline brain if not). Configure via environment variables or a `.env` file in
-the repo root / `~/.sefpet/.env`:
+offline brain if not). Configure via environment variables, the operating
+system credential store, or `~/.sefpet/.env`. It deliberately does not load a
+project, working-directory, or app-adjacent `.env` file.
 
 | Variable | Purpose |
 | --- | --- |
 | `SEFPET_AI_KEY` | API key (also accepts `GROQ_API_KEY`, `DEEPSEEK_API_KEY`, `INFERX_API_KEY`) |
-| `SEFPET_AI_BASE_URL` | OpenAI-compatible base URL (defaults to Groq) |
-| `SEFPET_AI_MODEL` | Model name (default `llama-3.3-70b-versatile`) |
+| `SEFPET_AI_BASE_URL` | HTTPS OpenAI-compatible base URL for a custom provider |
+| `SEFPET_AI_MODEL` | Model name for a custom provider |
+| `SEFPET_ALLOW_INSECURE_LOCAL` | Development only: allow an HTTP loopback endpoint when set to `1` |
 
 No key? The offline brain still handles greetings, jokes, facts, math, time,
 games, and a chatty personality.
+
+Provider keys are matched to their own endpoint automatically. To force a
+specific provider, set all three `SEFPET_AI_KEY`, `SEFPET_AI_BASE_URL`, and
+`SEFPET_AI_MODEL` values together.
+
+Store a key in the OS credential store without putting it in shell history:
+
+```bash
+python pet.py --store-ai-key GROQ_API_KEY
+```
+
+Supported credential names are `SEFPET_AI_KEY`, `GROQ_API_KEY`,
+`DEEPSEEK_API_KEY`, and `INFERX_API_KEY`. Custom endpoints must use HTTPS,
+cannot contain credentials/query parameters, and cannot point at
+private-network addresses. HTTP loopback endpoints are available only when the
+explicit development flag is enabled. Questions are sent to the configured
+provider only when AI is on.
+
+If you use `~/.sefpet/.env` on macOS or Linux, keep it private:
+
+```bash
+chmod 600 ~/.sefpet/.env
+```
+
+SefPet also repairs its config directory/file modes to `0700`/`0600` where the
+platform supports POSIX permissions.
+
+## Tests
+
+The security and headless helper tests run without showing a window:
+
+```bash
+QT_QPA_PLATFORM=offscreen python -m unittest discover -s tests -v
+```
 
 ## Building a standalone app
 

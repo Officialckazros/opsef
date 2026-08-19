@@ -10,13 +10,13 @@
 <message>  (in a DM)     Chat with it in a direct message.
 Attach image + mention   Vision model describes the image; brain uses it.
 React 👍 / 👎 on a reply  Feedback — learns + adjusts bond with you.
-Reply to a reply         Correction; stored and reflected into lessons.
+Reply "correction: ..." Explicit correction stored in the exact scope.
 
 Notes:
 - Remembers facts about YOU (merged/deduped, importance-ranked).
-- Short-term conversation history with each person.
+- Raw conversation history is off by default and requires scoped opt-in.
 - Per-user relationship score, private nickname, grudge.
-- Reads recent channel messages for context.
+- Reads only consented context when the guild history feature is enabled.
 - Every reply is an embed. Never uses emoji in its text.
 - One model for everything: DeepSeek V4 Flash via InferX (image vision uses a
   separate free multimodal model).
@@ -26,16 +26,13 @@ Notes:
 ------------------------------------------------------------------------------
 !help                    Full command map.
 
-!teach <fact>            Teach a SERVER fact.
-!teach @user <fact>      Teach a fact ABOUT that user.
+!teach <fact>            Teach a server fact (Manage Server); DMs teach yourself.
 
 !memories [@user]        List memories (with importance).
 !about                   Alias of !memories.
 !memory                  List memories.
-!memory erase [@user]    Wipe ALL memories about you/someone.
-!memory edit <id> <text> Edit a memory by id.
-!memory compact [@user]  Keep top memories, drop the rest.
-!forget <id>             Delete one memory by id.
+!memory erase/edit/...   Redirect to confirmation-gated `/memory` actions.
+!forget <id>             Redirect to confirmation-gated `/forget`.
 
 !bond [@user]            Relationship score, nickname, grudge.
 !relationship            Alias of !bond.
@@ -77,11 +74,11 @@ Notes:
 Normal @mentions / DMs stay full chaotic SefBot. Only the !assistant command
 drops the savage tone and answers as a clear, compliant helper for THAT reply
 (roles, timeouts, nicknames, channels, factual answers, etc.). There is no
-sticky on/off — the next @mention is chaotic again. Discord still enforces that
-YOU hold the matching permission for actions.
+sticky on/off — the next @mention is chaotic again. Ordinary chat never runs
+tools; confirmed `/act` requests recheck the exact permission and hierarchy.
 
-!music <song name>       Search YouTube, download, and send the MP3 directly.
-!song / !mp3             Aliases of !music.
+!music <song name>       Return a validated YouTube search/watch link.
+!song                    Alias of !music. MP3 downloading was removed.
                          (also: slash `/music song:<name>`)
 
 !privacy / !tos          Link to Terms & Privacy + data control commands.
@@ -89,15 +86,13 @@ YOU hold the matching permission for actions.
 !dmunblock               Re-enable bot-relayed DMs.
 !mydm                    Show DM opt-out status.
 
-!nuke <n> / !purge <n>   Delete the last n messages in this channel (1–100).
-                         Needs Manage Messages (you + bot). Includes the command.
-!lurk on|off             Proactive quiet-channel quips (manage server).
+!nuke <n> / !purge <n>   Redirect to confirmation-gated `/nuke`.
+!lurk on|off             Redirect to confirmation-gated `/lurk`.
 !config [show]           Guild settings + model info.
-!config swear full|medium|clean
-!config channels here|clear
+!config <change>         Redirect to confirmation-gated `/config`.
 
 !export                  Export guild brain JSON (manage server).
-!import                  Import from attachment or pasted JSON (manage server).
+!import                  Dry-run only; commit through confirmed `/import`.
 
 ------------------------------------------------------------------------------
  COMMUNITY COMMANDS
@@ -105,13 +100,13 @@ YOU hold the matching permission for actions.
 !<name> <input>          Run any !request-created command (fast model).
 
 ------------------------------------------------------------------------------
- AI ACTIONS (ask in chat — permission gated)
+ AI ACTIONS (`/act` only — permission and confirmation gated)
 ------------------------------------------------------------------------------
   kick_user / ban_user / assign_role / remove_role / dm_user /
   list_roles / set_status / chart / react_message
 
-Only runs if YOU hold the matching Discord permission
-(except react_message — anyone; bot can also react spontaneously).
+Ordinary chat never runs tools. `/act` proposes one action, binds it to the
+invoker/server/channel, and rechecks permissions and hierarchy on confirmation.
 
 ------------------------------------------------------------------------------
  OWNER TERMINAL (global shell — not Discord)

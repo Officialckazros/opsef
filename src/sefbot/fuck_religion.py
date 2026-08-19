@@ -2,25 +2,24 @@
 
 Two ways to use it:
 
-    PYTHONPATH=src python -m sefbot.fuck_religion                # load the built-in starter corpus
-    PYTHONPATH=src python -m sefbot.fuck_religion ./my_texts     # also ingest every .md/.txt/.markdown
-                                           # file in that folder (topic = filename)
+    PYTHONPATH=src python -m sefbot.fuck_religion --guild-id 123456789
+    PYTHONPATH=src python -m sefbot.fuck_religion --guild-id 123456789 ./my_texts
 
 "Every single piece of information about religion" is not a finite thing anyone
 can literally hand a bot — so this ships a solid, neutral, encyclopedic STARTER
-set covering the major traditions, and gives you a folder-ingest path to pour in
-as much more as you like (dump Wikipedia exports, scripture summaries, course
-notes, etc. as text files and point this script at them).
+set covering the major traditions, plus a bounded folder-ingest path for
+operator-reviewed text files.
 
 Content here is written to be factual and even-handed. Note that the default
 persona (config.PERSONA) is opinionated *against* religion; the KB is wired to
 be authoritative for ACCURACY regardless of tone, but if you want the bot to
 discuss religion respectfully, also soften that persona line.
 """
+import argparse
 import os
-import sys
 
 from sefbot import kb
+from sefbot.scope import Scope
 
 CORPUS = {
     "Religion (overview)": """
@@ -326,16 +325,18 @@ existence of God, the problem of evil, faith and reason, and religious language.
 }
 
 
-def seed_corpus() -> int:
+def seed_corpus(scope_id: str) -> int:
     total = 0
     for topic, text in CORPUS.items():
-        n = kb.ingest(text, topic=topic, title=topic, source="starter-corpus")
+        n = kb.ingest(
+            text, topic=topic, title=topic, source="starter-corpus", scope_id=scope_id
+        )
         print(f"  + {topic}: {n} passage(s)")
         total += n
     return total
 
 
-def seed_folder(path: str) -> int:
+def seed_folder(path: str, scope_id: str) -> int:
     exts = (".md", ".markdown", ".txt")
     total = 0
     for root, _dirs, files in os.walk(path):
@@ -350,31 +351,41 @@ def seed_folder(path: str) -> int:
                 print(f"  ! skip {fp}: {e}")
                 continue
             topic = os.path.splitext(fn)[0]
-            n = kb.ingest(text, topic=topic, title=topic, source=f"file:{fp}")
+            n = kb.ingest(
+                text, topic=topic, title=topic, source=f"file:{fp}", scope_id=scope_id
+            )
             print(f"  + {fp} → topic '{topic}': {n} passage(s)")
             total += n
     return total
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Seed one exact guild knowledge base")
+    parser.add_argument("--guild-id", required=True, type=int, help="target Discord guild id")
+    parser.add_argument("folder", nargs="?", help="optional folder of UTF-8 .md/.txt files")
+    args = parser.parse_args()
+    scope_id = Scope.guild(args.guild_id).key
     kb.ensure()
-    before = kb.count()
+    before = kb.count(scope_id)
     print(f"knowledge base has {before} passage(s) before seeding.\n")
 
     print("loading built-in religion starter corpus…")
-    total = seed_corpus()
+    total = seed_corpus(scope_id)
 
-    if len(sys.argv) > 1:
-        folder = sys.argv[1]
+    if args.folder:
+        folder = args.folder
         if os.path.isdir(folder):
             print(f"\ningesting files from {folder!r}…")
-            total += seed_folder(folder)
+            total += seed_folder(folder, scope_id)
         else:
             print(f"\n! {folder!r} is not a directory — skipping folder ingest.")
 
-    print(f"\ndone. added {total} passage(s); knowledge base now has {kb.count()}.")
+    print(
+        f"\ndone. added {total} passage(s); knowledge base now has "
+        f"{kb.count(scope_id)}."
+    )
     print("topics:")
-    for t in kb.topics():
+    for t in kb.topics(scope_id):
         print(f"  - {t['topic']}: {t['passages']}")
 
 

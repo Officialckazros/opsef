@@ -18,10 +18,13 @@ reference facts.
 Everything lives in the same SQLite file as the rest of the brain (`db.conn()`),
 so it persists on the same Railway volume with zero extra config.
 """
+import logging
 import re
 from typing import List, Optional
 
 from sefbot import db
+
+_LOG = logging.getLogger(__name__)
 
 _HAS_FTS5: Optional[bool] = None
 _READY = False
@@ -47,6 +50,7 @@ def ensure() -> None:
     c.executescript("""
     CREATE TABLE IF NOT EXISTS kb_docs (
         id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope_id TEXT NOT NULL DEFAULT 'legacy:disabled',
         topic   TEXT NOT NULL DEFAULT 'general',
         title   TEXT,
         source  TEXT,
@@ -54,8 +58,13 @@ def ensure() -> None:
         content TEXT NOT NULL,
         created REAL NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS idx_kb_topic ON kb_docs(topic);
     """)
+    columns = {r["name"] for r in c.execute("PRAGMA table_info(kb_docs)").fetchall()}
+    if "scope_id" not in columns:
+        c.execute(
+            "ALTER TABLE kb_docs ADD COLUMN scope_id TEXT NOT NULL DEFAULT 'legacy:disabled'"
+        )
+    c.execute("CREATE INDEX IF NOT EXISTS idx_kb_scope_topic ON kb_docs(scope_id,topic)")
     _HAS_FTS5 = _detect_fts5(c)
     if _HAS_FTS5:
         c.executescript("""
@@ -115,7 +124,7 @@ def _chunk(text: str, size: int = 700, overlap: int = 120) -> List[str]:
 
 
 def ingest(content: str, topic: str = "general", title: str = None,
-           source: str = None, tags: str = None) -> int:
+           source: str = None, tags: str = None, *, scope_id: str) -> int:
     """Chunk `content` and store each passage. Returns number of passages stored."""
     ensure()
     n = 0
@@ -125,9 +134,9 @@ def ingest(content: str, topic: str = "general", title: str = None,
         if title and i:
             ptitle = f"{title} ({i + 1})"
         c.execute(
-            "INSERT INTO kb_docs(topic,title,source,tags,content,created) "
-            "VALUES(?,?,?,?,?,?)",
-            (topic.strip() or "general", ptitle, source, tags, passage, db.now()),
+            "INSERT INTO kb_docs(scope_id,topic,title,source,tags,content,created) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (scope_id, topic.strip() or "general", ptitle, source, tags, passage, db.now()),
         )
         n += 1
     c.commit()
@@ -153,7 +162,7 @@ def _fts_query(query: str) -> str:
     return " OR ".join(f'"{w}"' for w in kws)
 
 
-def search(query: str, k: int = 6) -> List[dict]:
+def search(query: str, k: int = 6, *, scope_id: str) -> List[dict]:
     """Return up to `k` most relevant passages for `query`, best first."""
     ensure()
     c = db.conn()
@@ -166,17 +175,19 @@ def search(query: str, k: int = 6) -> List[dict]:
                 "SELECT d.topic AS topic, d.title AS title, d.source AS source, "
                 "d.content AS content, bm25(kb_fts) AS rank "
                 "FROM kb_fts JOIN kb_docs d ON d.id = kb_fts.rowid "
-                "WHERE kb_fts MATCH ? ORDER BY rank LIMIT ?",
-                (match, k),
+                "WHERE kb_fts MATCH ? AND d.scope_id=? ORDER BY rank LIMIT ?",
+                (match, scope_id, k),
             ).fetchall()
             return [dict(r) for r in rows]
         except Exception:
-            pass
+            _LOG.debug("FTS query failed; using bounded keyword fallback", exc_info=True)
     kws = _keywords(query)
     if not kws:
         return []
     scored = []
-    for r in c.execute("SELECT topic,title,source,content FROM kb_docs").fetchall():
+    for r in c.execute(
+        "SELECT topic,title,source,content FROM kb_docs WHERE scope_id=?", (scope_id,)
+    ).fetchall():
         low = (r["content"] or "").lower()
         hits = sum(1 for w in kws if w in low)
         if hits:
@@ -185,26 +196,31 @@ def search(query: str, k: int = 6) -> List[dict]:
     return [d for _, d in scored[:k]]
 
 
-def count() -> int:
+def count(scope_id: str) -> int:
     ensure()
-    return db.conn().execute("SELECT COUNT(*) n FROM kb_docs").fetchone()["n"]
+    return db.conn().execute(
+        "SELECT COUNT(*) n FROM kb_docs WHERE scope_id=?", (scope_id,)
+    ).fetchone()["n"]
 
 
-def topics() -> List[dict]:
+def topics(scope_id: str) -> List[dict]:
     ensure()
     rows = db.conn().execute(
-        "SELECT topic, COUNT(*) n FROM kb_docs GROUP BY topic ORDER BY n DESC"
+        "SELECT topic, COUNT(*) n FROM kb_docs WHERE scope_id=? "
+        "GROUP BY topic ORDER BY n DESC", (scope_id,)
     ).fetchall()
     return [{"topic": r["topic"], "passages": r["n"]} for r in rows]
 
 
-def clear(topic: str = None) -> int:
+def clear(scope_id: str, topic: str = None) -> int:
     """Delete all passages, or just one topic. Returns rows deleted."""
     ensure()
     c = db.conn()
     if topic:
-        cur = c.execute("DELETE FROM kb_docs WHERE topic=?", (topic.strip(),))
+        cur = c.execute(
+            "DELETE FROM kb_docs WHERE scope_id=? AND topic=?", (scope_id, topic.strip())
+        )
     else:
-        cur = c.execute("DELETE FROM kb_docs")
+        cur = c.execute("DELETE FROM kb_docs WHERE scope_id=?", (scope_id,))
     c.commit()
     return cur.rowcount

@@ -5,10 +5,13 @@ banned/kicked someone, who renamed a role, ...), pull real entries from the
 Discord audit log and hand them to the model as authoritative context instead
 of letting it guess or answer "I can't see that".
 """
+import logging
 import re
 import time
 
 import discord
+
+_LOG = logging.getLogger(__name__)
 
 _AUDIT_ASK_RE = re.compile(r"\b(?:who|what|why|when|which|check)\b", re.I)
 _AUDIT_VERB_RE = re.compile(
@@ -73,6 +76,7 @@ def _change_bits(entry) -> str:
         try:
             keys.update(k for k, _ in diff)
         except Exception:
+            _LOG.debug("could not enumerate an audit-log change diff", exc_info=True)
             continue
     bits = []
     for key in sorted(keys):
@@ -102,7 +106,7 @@ def _target_label(target) -> str:
     return str(name) if name else str(target)[:40]
 
 
-async def fetch_context(query: str, guild) -> str:
+async def fetch_context(query: str, guild, requester=None) -> str:
     """Return formatted audit-log lines for `query`, or "" when not applicable.
 
     Non-empty results are authoritative context for the brain. When the bot
@@ -110,6 +114,12 @@ async def fetch_context(query: str, guild) -> str:
     of inventing an answer.
     """
     if guild is None or not wants_audit_log(query):
+        return ""
+    requester_perms = getattr(requester, "guild_permissions", None)
+    if requester_perms is None or not (
+        requester_perms.view_audit_log or requester_perms.administrator
+    ):
+        # Do not even call Discord's audit-log API for an unauthorized user.
         return ""
     me = getattr(guild, "me", None)
     perms = getattr(me, "guild_permissions", None) if me is not None else None

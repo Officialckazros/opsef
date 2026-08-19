@@ -1,23 +1,23 @@
 # SefBot
 
-A Discord bot that starts dumb and gets smarter the more your server uses it. One model call per message returns a structured reply plus whatever it should remember, react to, or moderate — everything it sends comes back as an embed, no emoji.
+A privacy-first Discord assistant with scoped memory, human-approved administration tools, and optional moderation, vision, and voice features. Raw message history is off by default and ordinary chat cannot execute Discord actions.
 
 Built on top of [JayyDoesDev/airo](https://github.com/JayyDoesDev/airo), with a self-improvement layer bolted on.
 
 ## How it grows
 
-- **Memory** — it remembers stuff about you specifically and brings it up later. You can also just tell it things with `!teach`.
-- **Lessons** — upvotes/downvotes and corrections get distilled into rules that stick around and shape every future reply.
-- **Commands** — ask for a new command with `!request` and the AI writes one on the spot.
+- **Memory** — explicit memories are isolated to an exact guild or private scope. Users control raw-history consent separately with `/privacy`.
+- **Lessons** — feedback and deliberate corrections can be distilled into scoped behavior rather than a cross-server global prompt.
+- **Commands** — community command requests are stored as bounded prompt data, never executable host code.
 
 Stack enough of all three and its "level" climbs from Newborn to Sage.
 
 ## What it actually does
 
-- Every reply is one JSON object: `{response, memories, actions, chart, title}`. The bot just renders whatever comes back.
-- Memory is per Discord user id, and the model decides on its own what's worth keeping.
-- It reads recent channel messages so replies aren't context-blind.
-- It can take real actions — kick, ban, assign/remove roles, DM someone, list roles, set status — but only if the person who asked actually has that Discord permission. Instructions buried in someone else's message can't trigger this.
+- Model replies use a validated structured shape before they are rendered.
+- Guild, DM, and user data use exact scopes so one server or private conversation cannot read another.
+- Stored raw history requires both server enablement and the individual user's opt-in, and expires within 30 days.
+- Ordinary chat is read-only. `/act` may propose one administration action, but the invoking user must confirm an exact preview; permissions and role hierarchy are checked again at confirmation time.
 - Can throw together a chart (bar/line/pie/radar) via QuickChart, no API key needed.
 - `!vibecheck` gives an unfiltered read on how a channel's doing.
 - No emoji, ever, in anything it sends.
@@ -25,32 +25,54 @@ Stack enough of all three and its "level" climbs from Newborn to Sage.
 
 ## Why it's safe-ish
 
-Community-made commands via `!request` are prompt specs, not code — the AI generates `{name, description, behavior-prompt}` and that's stored as data. There's no code execution path at all. Moderation actions check the real permissions of whoever's asking, so you can't social-engineer the bot into banning people.
+Community-made commands via `!request` are prompt specs, not code. Discord-accessible host evaluation has been removed. Mutating actions are invoker-bound, single-use, and confirmation-gated; moderation classifiers create private staff review items instead of deleting messages on model output alone.
 
 ---
 
 ## Getting it running
 
-1. Make a bot at [discord.com/developers/applications](https://discord.com/developers/applications) → New Application → Bot → Reset Token. Turn on **Message Content Intent** under Privileged Gateway Intents. You don't need the Server Members intent.
-2. Invite it: OAuth2 → URL Generator → scope `bot`, permissions Send Messages / Read Message History / Add Reactions, plus Kick/Ban/Manage Roles if you want moderation to work.
-3. Get a Groq key at [console.groq.com/keys](https://console.groq.com/keys). Copy `.env.example` to `.env` and drop in `DISCORD_TOKEN` and `GROQ_API_KEY`, then:
+1. Make a bot at [discord.com/developers/applications](https://discord.com/developers/applications) → New Application → Bot → Reset Token. Under Privileged Gateway Intents turn on **Message Content Intent** (required) and **Server Members Intent** (recommended — makes `/act` moderation and user lookups more reliable; without it the bot falls back to REST fetches). **Voice States Intent** is on by default via `Intents.default()` — no action needed unless you changed the defaults.
+2. Invite it: OAuth2 → URL Generator → scope `bot`, permissions Send Messages / Read Message History / Add Reactions, plus Kick/Ban/Manage Roles if you want moderation to work. For voice, also tick **Connect** and **Speak**.
+3. Use Python 3.12–3.14, copy `.env.example` to `.env`, set `DISCORD_TOKEN`, `SEFBOT_PRIVACY_CONTACT`, and credentials for the AI providers you actually use. Restrict the file before starting:
 
 ```bash
 cp .env.example .env
+chmod 600 .env
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.lock
 PYTHONPATH=src python -m sefbot.bot
 ```
 
 ## Commands
 
-`@mention` it or DM it to chat. Beyond that: `!teach <fact>` (mention someone to teach the bot about them), `!memories [@user]`, `!request <idea>`, `!commands`, `!vibecheck`, `!stats`, `!forget <id>`, `!delcmd <name>`, `!reflect`, `!help`.
+`@mention` it or DM it to chat. Use `/privacy` for consent, export, and deletion; `/help` lists the currently registered commands and permissions.
+
+## Privacy, legal pages, and service health
+
+- Terms: [kozzyx.org/sefbot/terms](https://kozzyx.org/sefbot/terms)
+- Privacy: [kozzyx.org/sefbot/privacy](https://kozzyx.org/sefbot/privacy)
+- `/privacy status|opt-in|opt-out|export|delete` remains private and available without accepting the ToS. ToS acceptance is not raw-history consent.
+- Moderation, server rules, raw history, and voice transcription are disabled by default. Voice transcription additionally requires participant consent in the exact guild.
+- The built-in HTTP service exposes `/healthz` for liveness and `/readyz` for sanitized Discord/database readiness. `SEFBOT_PRIVACY_CONTACT` is required; `PORT` defaults to `8080` outside Railway.
+- Changing the legal version invalidates earlier acceptance, so users review material policy changes before resuming normal commands.
+
+## Modular AI features
+
+A second, self-contained model layer (`services/llm_client.py`) that talks to an OpenAI-compatible endpoint over `httpx`. Point `SEFBOT_LLM_BASE_URL` / `SEFBOT_LLM_API_KEY` at your inference provider and set the model ids in `.env` (see `.env.example`).
+
+- **`/ask <question> [mode=reasoning|fast]`** — one-shot Q&A. `reasoning` uses the best model (`SEFBOT_CHAT_MODEL`, default GPT OSS 120B); `fast` uses Llama 3.3 70B on Groq (`SEFBOT_FAST_MODEL`). Cooldown-protected.
+- **`/act <natural language>`** — moderators can ask for one typed action such as a timeout or ban. The bot shows an ephemeral, mention-safe preview bound to that invoker; only a confirmation within two minutes can proceed. The executor then re-resolves the target and rechecks the exact permission, bot capability, and role hierarchy. Schemas live in `function_registry.py`.
+- **Passive moderation** — disabled until `SEFBOT_SAFETY_ENABLED=1` and an administrator enables it for the guild. Safety GPT is a bounded classifier only: high-confidence flags go to a private staff review with **Delete message** / **Dismiss** controls. The model cannot delete content, warn users, or globally block anyone by itself.
+- **Vision** — `/describe [image] [url] [prompt]` and the right-click **Describe image** message context menu. Uses Qwen vision (`SEFBOT_VISION_MODEL`); one call returns both a description and a moderation flag. Remote URLs must resolve to a public HTTP(S) endpoint, redirects are revalidated, and downloads are streamed under `SEFBOT_VISION_MAX_IMAGE_BYTES`. PNG, JPEG, GIF, and WebP are supported. Cooldown-protected.
+- **Multilingual** — non-English messages are detected with `langdetect` (cheap, never the LLM). In a channel listed in `SEFBOT_MULTILINGUAL_CHANNELS`, Llama 3.3 70B replies in the message's own language; elsewhere the message is translated for the brain as before.
+- **Voice** — `/join`, `/leave`, and `/say <text>` provide playback/TTS. Live `/stt` is off by default and requires `manage_channels`, guild enablement, and consent from every non-bot participant; the session stops when its controller leaves or consent/channel visibility changes. The released `discord-ext-voice-recv` packages still require a vulnerable PyNaCl version, so the base install keeps PyNaCl ≥ 1.6.2 and safely leaves live receive unavailable until a compatible upstream release exists. Do not downgrade PyNaCl to enable it.
+- **Server rules (approval-gated)** — the optional preset runs only when `SEFBOT_RULES_ENABLED=1`, `SEFBOT_RULES_GUILD` is explicitly configured, and that guild enables it. Findings go to a private review channel. Approval rechecks the action-specific permission (`ban_members`, `kick_members`, `moderate_members`, or `manage_messages`) and bot hierarchy before doing anything; denial, timeout, or restart takes no action.
 
 ## Knowledge base
 
-Separate from the memory system — this is a real retrieval store (SQLite FTS5, BM25 ranked, no cap on size, unlike memories which decay). Relevant chunks get pulled into the prompt as facts the bot should treat as ground truth.
+Separate from the memory system, this is a scoped retrieval store (SQLite FTS5, BM25 ranked). Upload size, row count, chunk length, and prompt retrieval are bounded. Retrieved text is delimited as untrusted reference data and cannot authorize actions.
 
-`PYTHONPATH=src python -m sefbot.fuck_religion` loads the built-in starter corpus. Point it at a folder — `PYTHONPATH=src python -m sefbot.fuck_religion ./texts` — and it'll ingest every `.md`/`.txt` file in there too.
+`PYTHONPATH=src python -m sefbot.fuck_religion --guild-id 123456789` loads the built-in starter corpus into one exact guild scope. Add a folder argument to ingest its bounded `.md`/`.txt` files into that same scope.
 
 In Discord, mods can do `!kb add <topic> | <text>` or attach a file to `!kb add`. Anyone can run `!kb search <query>` or just `!kb` for stats. `SEFBOT_KB_TOPK` controls how many chunks get injected per message (default 6).
 
@@ -58,13 +80,13 @@ In Discord, mods can do `!kb add <topic> | <text>` or attach a file to `!kb add`
 
 Check [TOPGG.md](./TOPGG.md) for the full checklist. Worth knowing up front:
 
-- `!music` / `/music` downloads the track and sends it as an MP3.
+- `!music` / `/music` returns a validated YouTube search/watch link; the bot never downloads or redistributes tracks.
 - DMs relayed through the bot name the requester and support `!dmblock` / `!dmunblock`.
 - `!privacy` covers in-bot data controls.
 
 ## Where things live
 
-All bot code lives in `src/opsef/` (run with `PYTHONPATH=src python -m sefbot.bot`).
+All bot code lives in `src/sefbot/` (run with `PYTHONPATH=src python -m sefbot.bot`).
 
 - `bot.py` — Discord glue: chat, embeds, reaction feedback, commands, the reflection loop
 - `brain.py` — system prompt construction, memory retrieval, leveling, reflection
@@ -72,11 +94,29 @@ All bot code lives in `src/opsef/` (run with `PYTHONPATH=src python -m sefbot.bo
 - `embeds.py` — embed builders and the emoji stripper
 - `customcmds.py` — AI-generated, prompt-defined community commands
 - `db.py` — SQLite persistence with in-place migration
-- `kb.py` — the uncapped knowledge base (chunking, FTS5, BM25 retrieval)
+- `kb.py` — scoped, bounded knowledge-base ingestion and FTS5/BM25 retrieval
 - `fuck_religion.py` — seeds the KB with a starter corpus or a folder of text
 - `ai.py` — async Groq wrapper for chat and structured JSON
 - `config.py` — env config and the persona
+- `services/llm_client.py` — async httpx LLM wrapper (chat, tools, vision, STT, TTS) with retries
+- `function_registry.py` — tool schemas + permission-gated executors for `/act`
+- `moderation.py` — passive Safety GPT moderation, DM warnings, mod-log
+- `multilingual.py` — langdetect routing to Llama 3.3 70B
+- `vision.py` — `/describe` + context-menu image description
+- `voice.py` — `/join` `/leave` `/say` and Whisper live transcription
+- `rules.py` — server ruleset + approval-gated enforcement (Approve/Deny buttons)
+- `web.py` — legal pages plus liveness/readiness HTTP endpoints
 
 ## Deploying on Railway
 
-Ships with `railway.json` set up as a worker running `PYTHONPATH=src python -m sefbot.bot`. Since the brain lives in SQLite, you need a persistent volume — point `SEFBOT_DB` at `/data/sefbot.db` on a mounted volume or everything it's learned gets wiped on redeploy. `db.py` handles migrating an older database in place on startup.
+`railway.json` runs `PYTHONPATH=src python -m sefbot.bot` and checks `/readyz`, so a deployment is not marked healthy until both Discord and the database are ready. `.python-version` pins production to Python 3.14.7, while `nixpacks.toml` preserves the `python314` setup and installs the hash-locked `requirements.lock`. Set `SEFBOT_PRIVACY_CONTACT`; Railway supplies `PORT`. Since state lives in SQLite, mount a persistent volume and point `SEFBOT_DB` at `/data/sefbot.db`. Startup applies versioned migrations, purges legacy raw history, and enforces the configured retention ceiling before readiness is reported.
+
+## Verification
+
+The regression suite uses only Python's standard-library test runner:
+
+```bash
+PYTHONPATH=src python -m unittest discover -s tests -v
+PYTHONPATH=src python -m compileall -q src
+cd cloudflare-worker && npm ci --ignore-scripts && npm test && npm run dry-run
+```

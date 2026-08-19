@@ -1,7 +1,17 @@
-"""Central configuration, loaded from the environment / .env file."""
+"""Central configuration loaded from the environment.
+
+Importing library modules must not require a Discord token; executable entry
+points call :func:`validate_runtime` before connecting instead.
+"""
+import logging
 import os
+import stat
+from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
+
+_LOG = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -36,7 +46,15 @@ def _int(name: str, default: int) -> int:
         return default
 
 
-DISCORD_TOKEN = _req("DISCORD_TOKEN")
+def _bool(name: str, default: bool = False) -> bool:
+    """Parse a conventional boolean environment value."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+DISCORD_TOKEN = (os.getenv("DISCORD_TOKEN") or "").strip()
 
 INCEPTION_API_KEY = (
     os.getenv("INCEPTION_API_KEY") or os.getenv("MERCURY_API_KEY") or ""
@@ -179,7 +197,7 @@ MODEL = MODEL_SMART
 PREFIX = os.getenv("SEFBOT_PREFIX", "!")
 DB_PATH = os.getenv("SEFBOT_DB", "sefbot.db")
 
-OWNER_ID = (os.getenv("SEFBOT_OWNER_ID") or "1172433512364769342").strip()
+OWNER_ID = (os.getenv("SEFBOT_OWNER_ID") or "").strip()
 
 _BLOCKED_DEFAULT = ()
 BLOCKED_USER_IDS = {
@@ -191,20 +209,24 @@ BLOCKED_USER_IDS = {
     if x.strip()
 }
 
-SYNC_GUILDS = [g.strip() for g in os.getenv("SEFBOT_SYNC_GUILDS", "").split(",") if g.strip()]
+TARGET_SYNC_GUILD_ID = "1535083112709496903"
+SYNC_GUILDS = [
+    g.strip()
+    for g in os.getenv("SEFBOT_SYNC_GUILDS", TARGET_SYNC_GUILD_ID).split(",")
+    if g.strip()
+]
 
 
 def is_bot_owner(user_id) -> bool:
     """True if this Discord user id is SefBot's owner."""
-    return str(user_id or "").strip() == OWNER_ID
+    return bool(OWNER_ID) and str(user_id or "").strip() == OWNER_ID
 
 
 def is_blocked(user_id) -> bool:
     """True if this user is hard-blocked from using the bot in any way.
 
-    Checks static ids (hardcoded + SEFBOT_BLOCKED_USERS), the live
-    blocked_users.json list managed by the `block access` CLI / ToS
-    enforcement, and emergency ToS flags in sqlite.
+    Checks static ids from ``SEFBOT_BLOCKED_USERS``, transactional SQLite
+    blocks managed by the CLI/ToS enforcement, and legacy emergency flags.
     """
     uid = str(user_id or "").strip()
     if not uid:
@@ -216,13 +238,13 @@ def is_blocked(user_id) -> bool:
         if is_dynamically_blocked(uid):
             return True
     except Exception:
-        pass
+        _LOG.warning("dynamic block lookup failed", exc_info=True)
     try:
         from sefbot import tos as _tos
         if _tos.is_emergency_blocked(uid):
             return True
     except Exception:
-        pass
+        _LOG.warning("emergency ToS block lookup failed", exc_info=True)
     return False
 
 
@@ -238,6 +260,114 @@ EMBED_COLOR = int(os.getenv("SEFBOT_EMBED_COLOR", "0x5865F2"), 0)
 
 AI_MAX_CONCURRENCY = _int("SEFBOT_AI_MAX_CONCURRENCY", 10)
 CHAT_MIN_INTERVAL = _float("SEFBOT_CHAT_MIN_INTERVAL", 2.5)
+
+
+
+
+LLM_BASE_URL = (os.getenv("SEFBOT_LLM_BASE_URL") or "https://api.example-inference.com/v1").rstrip("/")
+LLM_API_KEY = (os.getenv("SEFBOT_LLM_API_KEY") or "").strip()
+GROQ_BASE_URL = (os.getenv("SEFBOT_GROQ_BASE_URL") or "https://api.groq.com/openai/v1").rstrip("/")
+
+CHAT_MODEL = os.getenv("SEFBOT_CHAT_MODEL", "gpt-oss-120b")
+FAST_MODEL = os.getenv("SEFBOT_FAST_MODEL", "llama-3.3-70b-versatile")
+TOOL_MODEL = os.getenv("SEFBOT_TOOL_MODEL", "gpt-oss-20b")
+VISION_MODEL = os.getenv("SEFBOT_VISION_MODEL", "qwen-3.6-27b")
+SAFETY_MODEL = os.getenv("SEFBOT_SAFETY_MODEL", "openai/gpt-oss-20b")
+
+
+
+SAFETY_BASE_URL = (os.getenv("SEFBOT_SAFETY_BASE_URL") or "https://openrouter.ai/api/v1").rstrip("/")
+SAFETY_API_KEY = (os.getenv("SEFBOT_SAFETY_API_KEY") or OPENROUTER_API_KEY).strip()
+MULTILINGUAL_MODEL = os.getenv("SEFBOT_MULTILINGUAL_MODEL", "llama-3.3-70b-versatile")
+WHISPER_MODEL = os.getenv("SEFBOT_WHISPER_MODEL", "whisper-large-v3-turbo")
+TTS_MODEL = os.getenv("SEFBOT_TTS_MODEL", "orpheus-3-0.1b-ft")
+TTS_VOICE = os.getenv("SEFBOT_TTS_VOICE", "tara")
+
+MODLOG_CHANNEL = (os.getenv("SEFBOT_MODLOG_CHANNEL") or "").strip()
+MULTILINGUAL_CHANNELS = [
+    c.strip() for c in os.getenv("SEFBOT_MULTILINGUAL_CHANNELS", "").split(",") if c.strip()
+]
+SAFETY_MIN_INTERVAL = _float("SEFBOT_SAFETY_MIN_INTERVAL", 3.0)
+SAFETY_ENABLED = _bool("SEFBOT_SAFETY_ENABLED", False)
+SAFETY_MIN_CONFIDENCE = min(1.0, max(0.0, _float("SEFBOT_SAFETY_MIN_CONFIDENCE", 0.85)))
+VISION_MAX_IMAGE_BYTES = max(1_000_000, _int("SEFBOT_VISION_MAX_IMAGE_BYTES", 8_000_000))
+STT_ENABLED = _bool("SEFBOT_STT_ENABLED", False)
+STT_MAX_UTTERANCE_SECONDS = max(
+    1.0, min(60.0, _float("SEFBOT_STT_MAX_UTTERANCE_SECONDS", 15.0))
+)
+
+
+RULES_GUILD = (os.getenv("SEFBOT_RULES_GUILD") or "").strip()
+RULES_ENABLED = _bool("SEFBOT_RULES_ENABLED", False)
+APPROVAL_CHANNEL = (os.getenv("SEFBOT_APPROVAL_CHANNEL") or "").strip()
+RULES_LLM_ENABLED = _bool("SEFBOT_RULES_LLM_ENABLED", True)
+RULES_LLM_MODEL = os.getenv("SEFBOT_RULES_LLM_MODEL", SAFETY_MODEL)
+
+SYNC_COMMANDS = _bool("SEFBOT_SYNC_COMMANDS", False)
+ALLOW_LOCAL_ENDPOINTS = _bool("SEFBOT_ALLOW_LOCAL_ENDPOINTS", False)
+WEB_HOST = (os.getenv("SEFBOT_WEB_HOST") or "0.0.0.0").strip()  # noqa: S104 - container bind
+WEB_PORT = max(1, min(65535, _int("PORT", 8080)))
+PRIVACY_CONTACT = (os.getenv("SEFBOT_PRIVACY_CONTACT") or "privacy@opsef.bot").strip()
+CONTENT_RETENTION_DAYS = max(1, min(30, _int("SEFBOT_RETENTION_DAYS", 30)))
+IMPORT_MAX_BYTES = max(1024, min(8_000_000, _int("SEFBOT_IMPORT_MAX_BYTES", 2_000_000)))
+
+
+def _valid_endpoint(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return False
+    hostname = (parsed.hostname or "").lower()
+    is_local = hostname in {"localhost", "127.0.0.1", "::1"}
+    if not hostname or (is_local and not ALLOW_LOCAL_ENDPOINTS):
+        return False
+    if parsed.scheme == "https":
+        return True
+    return bool(
+        ALLOW_LOCAL_ENDPOINTS
+        and parsed.scheme == "http"
+        and is_local
+    )
+
+
+def validate_runtime(*, require_discord: bool = True, require_web_legal: bool = False) -> None:
+    """Fail once with all actionable configuration errors."""
+    errors = []
+    if require_discord and not DISCORD_TOKEN:
+        errors.append("DISCORD_TOKEN is required to start the Discord bot")
+    if OWNER_ID and not OWNER_ID.isdigit():
+        errors.append("SEFBOT_OWNER_ID must be a Discord snowflake")
+    if RULES_GUILD and not RULES_GUILD.isdigit():
+        errors.append("SEFBOT_RULES_GUILD must be a Discord snowflake")
+    if require_web_legal and not PRIVACY_CONTACT:
+        errors.append("SEFBOT_PRIVACY_CONTACT is required for legal pages")
+    for name, value in (
+        ("INCEPTION_BASE_URL", INCEPTION_BASE_URL),
+        ("CELERIS_BASE_URL", CELERIS_BASE_URL),
+        ("DEEPSEEK_BASE_URL", DEEPSEEK_BASE_URL),
+        ("INFERX_BASE_URL", INFERX_BASE_URL),
+        ("SEFBOT_LLM_BASE_URL", LLM_BASE_URL),
+        ("SEFBOT_GROQ_BASE_URL", GROQ_BASE_URL),
+        ("SEFBOT_SAFETY_BASE_URL", SAFETY_BASE_URL),
+    ):
+        if value and not _valid_endpoint(value):
+            errors.append(
+                f"{name} must be HTTPS without credentials/query/fragment; "
+                "localhost additionally requires SEFBOT_ALLOW_LOCAL_ENDPOINTS=true"
+            )
+    if errors:
+        raise RuntimeError("Invalid configuration:\n- " + "\n- ".join(errors))
+
+
+def insecure_env_file() -> bool:
+    """Return True when a local .env is readable by group/other users."""
+    path = Path(".env")
+    try:
+        return bool(stat.S_IMODE(path.stat().st_mode) & 0o077)
+    except OSError:
+        return False
 
 DEFAULT_PERSONA = (
     "You are SefBot, an unhinged, wildly entertaining, foul-mouthed, and sarcastic Discord bot. "

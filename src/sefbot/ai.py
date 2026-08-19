@@ -11,14 +11,22 @@ Model routing
 """
 import asyncio
 import concurrent.futures
+import http.client
 import json
+import logging
+import queue
 import re
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import List, Optional, Union
 
 from groq import Groq
 
 from sefbot import config
+
+_LOG = logging.getLogger(__name__)
 
 _clients = [
     Groq(api_key=k, timeout=20.0, max_retries=0) for k in config.GROQ_KEYS
@@ -37,8 +45,14 @@ _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 
 _ROTATE_ON = ("rate limit", "rate_limit", "429", "too many requests",
               "503", "502", "overloaded", "capacity", "try again")
+_MAX_PROVIDER_RESPONSE_BYTES = 4_000_000
 
 ContentPart = Union[str, dict]
+
+
+def shutdown() -> None:
+    """Stop the legacy SDK worker pool during client shutdown."""
+    _EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
 
 def _next_index() -> int:
@@ -85,32 +99,59 @@ def _mercury_upstream_model(model: str) -> str:
     return m or "mercury-2"
 
 
-import http.client
-import queue
-import urllib.parse
-
 class HTTPSConnectionPool:
     def __init__(self, base_url: str, timeout: float = 15.0, max_size: int = 20):
         parsed = urllib.parse.urlparse(base_url)
-        self.host = parsed.netloc or "api.inceptionlabs.ai"
-        self.path_prefix = parsed.path.rstrip("/")
+        hostname = (parsed.hostname or "").lower()
+        is_local = hostname in {"localhost", "127.0.0.1", "::1"}
+        valid_https = parsed.scheme == "https" and (not is_local or config.ALLOW_LOCAL_ENDPOINTS)
+        valid_dev_http = parsed.scheme == "http" and is_local and config.ALLOW_LOCAL_ENDPOINTS
+        valid = bool(
+            hostname
+            and not parsed.username
+            and not parsed.password
+            and not parsed.query
+            and not parsed.fragment
+            and (valid_https or valid_dev_http)
+        )
+        self.host = parsed.netloc if valid else ""
+        self.path_prefix = parsed.path.rstrip("/") if valid else ""
+        self.connection_type = (
+            http.client.HTTPConnection if valid_dev_http else http.client.HTTPSConnection
+        )
         self.timeout = timeout
         self.pool = queue.Queue(maxsize=max_size)
 
-    def get(self) -> http.client.HTTPSConnection:
+    def get(self) -> http.client.HTTPConnection:
+        if not self.host:
+            raise RuntimeError("invalid provider endpoint")
         try:
             return self.pool.get_nowait()
         except queue.Empty:
-            return http.client.HTTPSConnection(self.host, timeout=self.timeout)
+            return self.connection_type(self.host, timeout=self.timeout)
 
-    def put(self, conn: http.client.HTTPSConnection):
+    def put(self, conn: http.client.HTTPConnection):
         try:
             self.pool.put_nowait(conn)
         except queue.Full:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            _close_connection(conn)
+
+
+def _close_connection(conn: http.client.HTTPConnection) -> None:
+    """Best-effort disposal for a broken pooled connection."""
+    try:
+        conn.close()
+    except Exception:
+        _LOG.debug("failed to close provider connection", exc_info=True)
+
+
+def _read_limited(response) -> bytes:
+    """Read a provider response without allowing unbounded memory growth."""
+    payload = response.read(_MAX_PROVIDER_RESPONSE_BYTES + 1)
+    if len(payload) > _MAX_PROVIDER_RESPONSE_BYTES:
+        raise RuntimeError("provider response exceeded the size limit")
+    return payload
+
 
 _mercury_pool = HTTPSConnectionPool(config.INCEPTION_BASE_URL, timeout=15.0, max_size=20)
 _celeris_pool = HTTPSConnectionPool(config.CELERIS_BASE_URL, timeout=15.0, max_size=20)
@@ -183,36 +224,26 @@ def _celeris_generate(model, system, messages, max_tokens, temperature) -> str:
         try:
             conn.request("POST", endpoint, body=data, headers=headers)
             res = conn.getresponse()
-            raw_bytes = res.read()
+            raw_bytes = _read_limited(res)
             if res.status >= 400:
-                detail = raw_bytes.decode("utf-8", "ignore")[:300]
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                raise RuntimeError(f"celeris {res.status}: {detail}")
+                _close_connection(conn)
+                raise RuntimeError(f"celeris request failed ({res.status})")
             _celeris_pool.put(conn)
             raw = raw_bytes.decode("utf-8")
             break
         except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError):
-            try:
-                conn.close()
-            except Exception:
-                pass
+            _close_connection(conn)
             if attempt == 1:
                 raise
         except Exception:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            _close_connection(conn)
             raise
 
     if not raw:
         raise RuntimeError("celeris: empty response")
     d = json.loads(raw)
     if "choices" not in d:
-        raise RuntimeError(f"celeris: {json.dumps(d.get('error', d))[:200]}")
+        raise RuntimeError("celeris returned a malformed response")
     text = (d["choices"][0].get("message") or {}).get("content")
     if not text or not str(text).strip():
         raise RuntimeError("celeris: empty content")
@@ -264,29 +295,19 @@ def _mercury_generate(model, system, messages, max_tokens, temperature) -> str:
         try:
             conn.request("POST", endpoint, body=data, headers=headers)
             res = conn.getresponse()
-            raw_bytes = res.read()
+            raw_bytes = _read_limited(res)
             if res.status >= 400:
-                detail = raw_bytes.decode("utf-8", "ignore")[:300]
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                raise RuntimeError(f"mercury {res.status}: {detail}")
+                _close_connection(conn)
+                raise RuntimeError(f"mercury request failed ({res.status})")
             _mercury_pool.put(conn)
             raw = raw_bytes.decode("utf-8")
             break
         except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError):
-            try:
-                conn.close()
-            except Exception:
-                pass
+            _close_connection(conn)
             if attempt == 1:
                 raise
         except Exception:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            _close_connection(conn)
             raise
 
     if not raw:
@@ -294,7 +315,7 @@ def _mercury_generate(model, system, messages, max_tokens, temperature) -> str:
 
     d = json.loads(raw)
     if "choices" not in d:
-        raise RuntimeError(f"mercury: {json.dumps(d.get('error', d))[:200]}")
+        raise RuntimeError("mercury returned a malformed response")
     text = (d["choices"][0].get("message") or {}).get("content")
     if not text or not str(text).strip():
         raise RuntimeError("mercury: empty content")
@@ -352,9 +373,6 @@ def _gemini_parts_from_content(c) -> list:
 
 def _gemini_generate(model, system, messages, max_tokens, temperature) -> str:
     """Google Gemini call (different API shape: system is separate, roles differ)."""
-    import urllib.error
-    import urllib.request
-
     if not config.GEMINI_KEYS:
         raise RuntimeError("no gemini api key configured")
 
@@ -386,13 +404,18 @@ def _gemini_generate(model, system, messages, max_tokens, temperature) -> str:
 
     last = None
     for key in config.GEMINI_KEYS:
-        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-               f"{model}:generateContent?key={key}")
+        safe_model = urllib.parse.quote(str(model), safe="-._")
+        query = urllib.parse.urlencode({"key": key})
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{safe_model}:generateContent?{query}"
+        )
         try:
-            req = urllib.request.Request(
+            req = urllib.request.Request(  # noqa: S310 -- fixed HTTPS provider host
                 url, data=data, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=20) as r:
-                d = json.loads(r.read())
+            # The host and scheme above are fixed; only encoded path/query values vary.
+            with urllib.request.urlopen(req, timeout=20) as r:  # noqa: S310
+                d = json.loads(_read_limited(r))
             for cand in d.get("candidates") or []:
                 parts = cand.get("content", {}).get("parts", []) or []
                 text = "".join(p.get("text", "") for p in parts).strip()
@@ -400,12 +423,7 @@ def _gemini_generate(model, system, messages, max_tokens, temperature) -> str:
                     return text
             return ""
         except urllib.error.HTTPError as e:
-            detail = ""
-            try:
-                detail = e.read().decode()[:200]
-            except Exception:
-                pass
-            last = RuntimeError(f"gemini {e.code}: {detail}")
+            last = RuntimeError(f"gemini request failed ({e.code})")
             if e.code in (429, 500, 502, 503):
                 continue
             raise last
@@ -427,9 +445,6 @@ def _cerebras_generate(model, system, messages, max_tokens, temperature) -> str:
     like a bad key), and reasoning-style models can return a message with a
     `reasoning` field but no `content` — which must raise, not return empty.
     """
-    import urllib.error
-    import urllib.request
-
     if not config.CEREBRAS_API_KEY:
         raise RuntimeError("no cerebras api key configured")
 
@@ -446,7 +461,7 @@ def _cerebras_generate(model, system, messages, max_tokens, temperature) -> str:
         "temperature": temperature,
         "messages": full,
     }).encode()
-    req = urllib.request.Request(
+    req = urllib.request.Request(  # noqa: S310 -- fixed HTTPS provider endpoint
         "https://api.cerebras.ai/v1/chat/completions", data=body,
         headers={
             "Authorization": f"Bearer {config.CEREBRAS_API_KEY}",
@@ -455,17 +470,14 @@ def _cerebras_generate(model, system, messages, max_tokens, temperature) -> str:
         },
     )
     try:
-        d = json.loads(urllib.request.urlopen(req, timeout=20).read())
+        # The request URL is a fixed HTTPS provider endpoint.
+        with urllib.request.urlopen(req, timeout=20) as response:  # noqa: S310
+            d = json.loads(_read_limited(response))
     except urllib.error.HTTPError as e:
-        detail = ""
-        try:
-            detail = e.read().decode()[:200]
-        except Exception:
-            pass
-        raise RuntimeError(f"cerebras {e.code}: {detail}")
+        raise RuntimeError(f"cerebras request failed ({e.code})") from None
 
     if "choices" not in d:
-        raise RuntimeError(f"cerebras: {json.dumps(d)[:200]}")
+        raise RuntimeError("cerebras returned a malformed response")
     text = (d["choices"][0].get("message") or {}).get("content")
     if not text or not str(text).strip():
         raise RuntimeError("cerebras: empty content")
@@ -501,9 +513,6 @@ def _openrouter_generate(model, system, messages, max_tokens, temperature) -> st
 
     Multimodal (vision) messages are forwarded as-is — do not strip image parts.
     """
-    import urllib.error
-    import urllib.request
-
     api_key = _openrouter_key(model)
     if not api_key:
         raise RuntimeError("no openrouter api key configured")
@@ -527,7 +536,7 @@ def _openrouter_generate(model, system, messages, max_tokens, temperature) -> st
         "provider": {"require_parameters": False},
         "route": "fallback",
     }).encode()
-    req = urllib.request.Request(
+    req = urllib.request.Request(  # noqa: S310 -- fixed HTTPS provider endpoint
         "https://openrouter.ai/api/v1/chat/completions", data=body,
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -536,17 +545,14 @@ def _openrouter_generate(model, system, messages, max_tokens, temperature) -> st
         },
     )
     try:
-        d = json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+        # The request URL is a fixed HTTPS provider endpoint.
+        with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
+            d = json.loads(_read_limited(response))
     except urllib.error.HTTPError as e:
-        detail = ""
-        try:
-            detail = e.read().decode()[:200]
-        except Exception:
-            pass
-        raise RuntimeError(f"openrouter {e.code}: {detail}")
+        raise RuntimeError(f"openrouter request failed ({e.code})") from None
 
     if "choices" not in d:
-        raise RuntimeError(f"openrouter: {json.dumps(d.get('error', d))[:200]}")
+        raise RuntimeError("openrouter returned a malformed response")
     text = (d["choices"][0].get("message") or {}).get("content")
     if not text or not str(text).strip():
         raise RuntimeError("openrouter: empty content")
@@ -559,9 +565,6 @@ def _is_deepseek(model: str) -> bool:
 
 def _deepseek_generate(model, system, messages, max_tokens, temperature) -> str:
     """DeepSeek (OpenAI-compatible). Used by !ask and the assistant command."""
-    import urllib.error
-    import urllib.request
-
     if not config.DEEPSEEK_API_KEY:
         raise RuntimeError("no deepseek api key configured")
 
@@ -578,7 +581,7 @@ def _deepseek_generate(model, system, messages, max_tokens, temperature) -> str:
         "temperature": temperature,
         "messages": full,
     }).encode()
-    req = urllib.request.Request(
+    req = urllib.request.Request(  # noqa: S310 -- validated provider base URL
         config.DEEPSEEK_BASE_URL + "/chat/completions", data=body,
         headers={
             "Authorization": f"Bearer {config.DEEPSEEK_API_KEY}",
@@ -587,17 +590,14 @@ def _deepseek_generate(model, system, messages, max_tokens, temperature) -> str:
         },
     )
     try:
-        d = json.loads(urllib.request.urlopen(req, timeout=30).read())
+        # Configuration validation restricts this base URL to HTTPS (or explicit dev localhost).
+        with urllib.request.urlopen(req, timeout=30) as response:  # noqa: S310
+            d = json.loads(_read_limited(response))
     except urllib.error.HTTPError as e:
-        detail = ""
-        try:
-            detail = e.read().decode()[:200]
-        except Exception:
-            pass
-        raise RuntimeError(f"deepseek {e.code}: {detail}")
+        raise RuntimeError(f"deepseek request failed ({e.code})") from None
 
     if "choices" not in d:
-        raise RuntimeError(f"deepseek: {json.dumps(d)[:200]}")
+        raise RuntimeError("deepseek returned a malformed response")
     text = (d["choices"][0].get("message") or {}).get("content")
     if not text or not str(text).strip():
         raise RuntimeError("deepseek: empty content")
@@ -610,9 +610,6 @@ def _is_inferx(model: str) -> bool:
 
 def _inferx_generate(model, system, messages, max_tokens, temperature) -> str:
     """InferX (OpenAI-compatible). Serves the deepseek model for !ask/assistant."""
-    import urllib.error
-    import urllib.request
-
     if not config.INFERX_API_KEY:
         raise RuntimeError("no inferx api key configured")
 
@@ -629,7 +626,7 @@ def _inferx_generate(model, system, messages, max_tokens, temperature) -> str:
         "temperature": temperature,
         "messages": full,
     }).encode()
-    req = urllib.request.Request(
+    req = urllib.request.Request(  # noqa: S310 -- validated provider base URL
         config.INFERX_BASE_URL + "/chat/completions", data=body,
         headers={
             "Authorization": f"Bearer {config.INFERX_API_KEY}",
@@ -638,17 +635,14 @@ def _inferx_generate(model, system, messages, max_tokens, temperature) -> str:
         },
     )
     try:
-        d = json.loads(urllib.request.urlopen(req, timeout=30).read())
+        # Configuration validation restricts this base URL to HTTPS (or explicit dev localhost).
+        with urllib.request.urlopen(req, timeout=30) as response:  # noqa: S310
+            d = json.loads(_read_limited(response))
     except urllib.error.HTTPError as e:
-        detail = ""
-        try:
-            detail = e.read().decode()[:200]
-        except Exception:
-            pass
-        raise RuntimeError(f"inferx {e.code}: {detail}")
+        raise RuntimeError(f"inferx request failed ({e.code})") from None
 
     if "choices" not in d:
-        raise RuntimeError(f"inferx: {json.dumps(d)[:200]}")
+        raise RuntimeError("inferx returned a malformed response")
     text = (d["choices"][0].get("message") or {}).get("content")
     if not text or not str(text).strip():
         raise RuntimeError("inferx: empty content")
@@ -788,6 +782,7 @@ def _generate(requested, system, messages, max_tokens, temperature,
 def friendly_error(e: Exception) -> str:
     """Turn an API error into something a human wants to read."""
     s = str(e)
+    _LOG.warning("provider call failed (%s)", type(e).__name__)
     if _is_rate_limited(e):
         import re as _re
         m = _re.search(r"try again in ([0-9hms.]+)", s, _re.I)
@@ -803,7 +798,7 @@ def friendly_error(e: Exception) -> str:
         return "celeris key rejected — regenerate at console.celeris.ai"
     if "deepseek" in s.lower() and ("401" in s or "invalid" in s.lower()):
         return "deepseek key rejected — check DEEPSEEK_API_KEY."
-    return f"my brain hiccuped: {s[:180]}"
+    return "my brain hiccuped. try again in a moment"
 
 
 async def _run(fn):
@@ -906,39 +901,6 @@ async def json_call(
     return _extract_json(raw)
 
 
-def _fetch_image_as_data_url(url: str, max_bytes: int = 8_000_000) -> Optional[str]:
-    """Download an image and return a data: URL. Many vision APIs choke on
-    Discord CDN / short-lived embed URLs when they try to fetch them themselves;
-    inlining base64 is far more reliable."""
-    import base64
-    import mimetypes
-    import urllib.error
-    import urllib.request
-
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; SefBot/1.0; +https://discord.com)",
-            "Accept": "image/*,*/*;q=0.8",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = resp.read(max_bytes + 1)
-            if len(data) > max_bytes:
-                return None
-            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as e:
-        print(f"[vision] download failed for {url[:80]}: {e}")
-        return None
-
-    if not ctype.startswith("image/"):
-        guess, _ = mimetypes.guess_type(url.split("?")[0])
-        ctype = guess if guess and guess.startswith("image/") else "image/png"
-    b64 = base64.b64encode(data).decode("ascii")
-    return f"data:{ctype};base64,{b64}"
-
-
 async def describe_images(image_urls: List[str], caption: str = "") -> str:
     """Vision pass: short description of attached / embed image URLs.
 
@@ -948,17 +910,29 @@ async def describe_images(image_urls: List[str], caption: str = "") -> str:
     if not image_urls:
         return ""
 
-    async def _prep(url: str) -> str:
-        data_url = await _run(lambda u=url: _fetch_image_as_data_url(u))
-        return data_url or url
+    import base64
+
+    from sefbot.services.llm_client import llm
+
+    async def _prep(url: str) -> Optional[str]:
+        downloaded = await llm.get_image(url, max_bytes=config.VISION_MAX_IMAGE_BYTES)
+        if not downloaded:
+            return None
+        data, mime = downloaded
+        return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
     prepared: List[str] = []
     for url in image_urls[:4]:
         try:
-            prepared.append(await _prep(url))
-        except Exception as e:
-            print(f"[vision] prep failed: {e}")
-            prepared.append(url)
+            item = await _prep(url)
+            if item:
+                prepared.append(item)
+        except Exception:
+            _LOG.debug("Discord CDN image preparation failed", exc_info=True)
+            continue
+
+    if not prepared:
+        return ""
 
     parts: List[dict] = []
     text = caption.strip() or "Describe what you see in these image(s), briefly and bluntly."
@@ -970,7 +944,6 @@ async def describe_images(image_urls: List[str], caption: str = "") -> str:
     seen = set()
     vision_fallbacks = [m for m in vision_fallbacks if m and not (m in seen or seen.add(m))]
 
-    last_err: Exception = RuntimeError("no vision attempt")
     for i, model in enumerate(vision_fallbacks):
         try:
             out = await chat(
@@ -991,12 +964,10 @@ async def describe_images(image_urls: List[str], caption: str = "") -> str:
                 if i:
                     print(f"[vision] served by fallback {model}")
                 return out.strip()
-            last_err = RuntimeError("empty vision response")
         except Exception as e:
-            last_err = e
-            print(f"[vision] {model} failed: {e}")
+            _LOG.warning("vision provider %s failed (%s)", model, type(e).__name__)
             continue
-    return f"(vision failed: {last_err})"
+    return "(vision failed: provider unavailable)"
 
 
 def _ddg_results(query: str, k: int) -> List[dict]:
@@ -1024,9 +995,7 @@ def _ddg_results(query: str, k: int) -> List[dict]:
 
 def _tavily_results(query: str, k: int) -> List[dict]:
     """Tavily search API (reliable from cloud IPs). Used when TAVILY_API_KEY is set."""
-    import json as _json
-    import urllib.request
-    body = _json.dumps({
+    body = json.dumps({
         "api_key": config.TAVILY_API_KEY, "query": query,
         "max_results": k, "search_depth": "basic",
     }).encode()
@@ -1034,8 +1003,9 @@ def _tavily_results(query: str, k: int) -> List[dict]:
         "https://api.tavily.com/search", data=body,
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        d = _json.loads(resp.read())
+    # The request URL is a fixed HTTPS provider endpoint.
+    with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310
+        d = json.loads(_read_limited(resp))
     return [
         {"title": r.get("title"), "href": r.get("url"), "body": r.get("content", "")}
         for r in d.get("results", [])
@@ -1050,7 +1020,7 @@ def _search_backend(query: str, k: int) -> List[dict]:
             if r:
                 return r
         except Exception:
-            pass
+            _LOG.debug("Tavily search failed; falling back to DuckDuckGo", exc_info=True)
     return _ddg_results(query, k)
 
 

@@ -7,12 +7,16 @@ trigger an action — only what the requester is entitled to do themselves.
 This is the only thing standing between "full server control" and any random
 member pinging the bot into doing something destructive — do not weaken it.
 
-Exception: react_message is a soft, non-destructive action available to anyone
-(including as spontaneous vibes from the model). The bot still needs Add
-Reactions in the channel.
+All model-emitted actions, including reactions, are proposals until a caller
+explicitly marks the request as human-confirmed.  This fail-closed default is
+intentional: callers which render confirmation UI must bind that UI to the
+requesting member and re-resolve permissions immediately before calling this
+module with ``confirmed=True``.
 """
 import datetime
 import json
+import logging
+import math
 import re
 import urllib.parse
 from typing import List, Optional, Union
@@ -20,6 +24,8 @@ from typing import List, Optional, Union
 import discord
 
 from sefbot import config
+
+log = logging.getLogger("sefbot.actions")
 
 _PERMS = {
     "kick_user": "kick_members",
@@ -41,7 +47,7 @@ _PERMS = {
     "set_slowmode": "manage_channels",
     "set_channel_topic": "manage_channels",
     "react_message": None,
-    "deny_media_perms": "manage_channels",
+    "deny_media_perms": "manage_roles",
 }
 
 _MAX_REACTS = 5
@@ -50,6 +56,33 @@ _CUSTOM_EMOJI_RE = re.compile(r"<a?:([A-Za-z0-9_]+):(\d+)>")
 _MAX_TIMEOUT_MINUTES = 40320
 _MAX_PURGE = 100
 _MAX_SLOWMODE = 21600
+_MAX_ACTIONS_PER_CONFIRMATION = 1
+_MAX_REASON_LENGTH = 500
+_MAX_DM_LENGTH = 1500
+
+_EXACT_MEMBER_TARGET_ACTIONS = frozenset(
+    {
+        "kick_user",
+        "ban_user",
+        "assign_role",
+        "remove_role",
+        "dm_user",
+        "timeout_user",
+        "remove_timeout",
+        "set_nickname",
+        "deny_media_perms",
+        "list_roles",
+    }
+)
+_EXACT_CHANNEL_TARGET_ACTIONS = frozenset(
+    {
+        "delete_channel",
+        "set_slowmode",
+        "set_channel_topic",
+        "deny_media_perms",
+        "purge_messages",
+    }
+)
 
 _STATUS_KINDS = {
     "playing": discord.ActivityType.playing,
@@ -57,6 +90,16 @@ _STATUS_KINDS = {
     "watching": discord.ActivityType.watching,
     "competing": discord.ActivityType.competing,
 }
+
+_CHART_TYPES = frozenset({"bar", "line", "pie", "doughnut", "radar", "polarArea"})
+_CHART_COLORS = (
+    "#5865f2",
+    "#57f287",
+    "#fee75c",
+    "#eb459e",
+    "#ed4245",
+    "#4e5d94",
+)
 
 
 _TYPE_ALIASES = {
@@ -104,6 +147,86 @@ def _uid(raw) -> Optional[int]:
     return int(s) if s.isdigit() else None
 
 
+def _channel_id(raw) -> Optional[int]:
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if value.startswith("<#") and value.endswith(">"):
+        value = value[2:-1]
+    return int(value) if value.isdigit() else None
+
+
+def _role_id(raw) -> Optional[int]:
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if value.startswith("<@&") and value.endswith(">"):
+        value = value[3:-1]
+    return int(value) if value.isdigit() else None
+
+
+def chart_url(raw_chart: object) -> Optional[str]:
+    """Build a bounded QuickChart URL from a small, data-only chart schema.
+
+    Arbitrary Chart.js options are deliberately ignored so model output cannot
+    inject scriptable callbacks or make an unbounded URL. Invalid charts simply
+    render without an image.
+    """
+    if not isinstance(raw_chart, dict):
+        return None
+    chart_type = str(raw_chart.get("type") or "bar")
+    if chart_type not in _CHART_TYPES:
+        return None
+    labels_raw = raw_chart.get("labels")
+    datasets_raw = raw_chart.get("datasets")
+    if not isinstance(labels_raw, list) or not isinstance(datasets_raw, list):
+        return None
+    labels = [str(label)[:50] for label in labels_raw[:20]]
+    if not labels:
+        return None
+    datasets = []
+    for index, raw_dataset in enumerate(datasets_raw[:5]):
+        if not isinstance(raw_dataset, dict) or not isinstance(raw_dataset.get("data"), list):
+            continue
+        values = []
+        for raw_value in raw_dataset["data"][: len(labels)]:
+            if isinstance(raw_value, bool):
+                values.append(0)
+                continue
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                value = 0.0
+            if not math.isfinite(value):
+                value = 0.0
+            values.append(max(-1_000_000_000, min(1_000_000_000, value)))
+        values.extend([0.0] * (len(labels) - len(values)))
+        color = _CHART_COLORS[index % len(_CHART_COLORS)]
+        datasets.append(
+            {
+                "label": str(raw_dataset.get("label") or f"Series {index + 1}")[:50],
+                "data": values,
+                "borderColor": color,
+                "backgroundColor": color,
+            }
+        )
+    if not datasets:
+        return None
+    config_payload = {
+        "type": chart_type,
+        "data": {"labels": labels, "datasets": datasets},
+        "options": {
+            "animation": False,
+            "plugins": {"legend": {"display": len(datasets) > 1}},
+        },
+    }
+    encoded = urllib.parse.urlencode(
+        {"c": json.dumps(config_payload, ensure_ascii=False, separators=(",", ":"))}
+    )
+    url = f"https://quickchart.io/chart?{encoded}"
+    return url if len(url) <= 8_000 else None
+
+
 def _has(member: discord.Member, perm: Optional[str], channel=None) -> bool:
     """Whether *member* holds *perm*.
 
@@ -143,9 +266,11 @@ def _role_above(actor: discord.Member, other: discord.Member) -> bool:
     return actor.top_role > other.top_role
 
 
-def _bot_can_act_on(guild, target: discord.Member) -> Optional[str]:
+def _bot_can_act_on(
+    guild, target: discord.Member, bot_member: Optional[discord.Member] = None
+) -> Optional[str]:
     """Return an error string if the bot cannot moderate *target*, else None."""
-    me = _bot_member(guild)
+    me = bot_member or _bot_member(guild)
     if me is None:
         return "blocked: I am not a member of this server"
     if target.id == me.id:
@@ -163,7 +288,7 @@ def _bot_can_act_on(guild, target: discord.Member) -> Optional[str]:
 def _requester_can_act_on(requester: discord.Member, target: discord.Member) -> Optional[str]:
     """Prevent junior mods from using the bot to moderate seniors."""
     if requester.id == target.id:
-        return None
+        return "denied: you can't use a moderation action on yourself"
     if not _role_above(requester, target):
         return (
             f"denied: your role is not above {target.display_name}'s "
@@ -172,8 +297,10 @@ def _requester_can_act_on(requester: discord.Member, target: discord.Member) -> 
     return None
 
 
-def _bot_can_manage_role(guild, role: discord.Role) -> Optional[str]:
-    me = _bot_member(guild)
+def _bot_can_manage_role(
+    guild, role: discord.Role, bot_member: Optional[discord.Member] = None
+) -> Optional[str]:
+    me = bot_member or _bot_member(guild)
     if me is None:
         return "blocked: I am not a member of this server"
     if not me.guild_permissions.manage_roles and not me.guild_permissions.administrator:
@@ -190,23 +317,27 @@ def _bot_can_manage_role(guild, role: discord.Role) -> Optional[str]:
     return None
 
 
-def _resolve_role(guild, raw) -> Optional[discord.Role]:
-    """Resolve a role by id, mention, or name."""
+async def _resolve_role(guild, raw, *, fresh: bool = False) -> Optional[discord.Role]:
+    """Resolve a role by exact id or mention, optionally bypassing the cache."""
     if guild is None or raw is None:
         return None
     s = str(raw).strip()
     if not s:
         return None
-    if s.startswith("<@&") and s.endswith(">"):
-        s = s[3:-1]
-    if s.isdigit():
-        role = guild.get_role(int(s))
-        if role is not None:
-            return role
-    return discord.utils.find(lambda r: r.name.lower() == s.lower(), guild.roles)
+    role_id = _role_id(s)
+    if role_id is None:
+        return None
+    if fresh:
+        try:
+            return discord.utils.get(await guild.fetch_roles(), id=role_id)
+        except (discord.Forbidden, discord.HTTPException):
+            return None
+    return guild.get_role(role_id)
 
 
-async def _resolve_member(guild, raw, requester=None) -> Optional[discord.Member]:
+async def _resolve_member(
+    guild, raw, requester=None, *, fresh: bool = False
+) -> Optional[discord.Member]:
     """Resolve a user id, mention, or name to a Member."""
     if raw is None or guild is None:
         return None
@@ -219,13 +350,18 @@ async def _resolve_member(guild, raw, requester=None) -> Optional[discord.Member
             return m
     uid = _uid(raw)
     if uid is not None:
+        if fresh:
+            try:
+                return await guild.fetch_member(uid)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return None
         m = guild.get_member(uid)
         if m:
             return m
         try:
             return await guild.fetch_member(uid)
         except discord.HTTPException:
-            pass
+            log.debug("member fetch failed in guild %s", getattr(guild, "id", None))
     s = s_raw.lstrip("@").lower()
     if not s:
         return None
@@ -241,32 +377,69 @@ async def _resolve_member(guild, raw, requester=None) -> Optional[discord.Member
         members = await guild.query_members(query=s, limit=5)
         if members:
             return members[0]
-    except Exception:
-        pass
+    except discord.HTTPException:
+        log.debug("member query failed in guild %s", getattr(guild, "id", None))
     return None
 
 
-def _resolve_channel(guild, current_channel, raw_name):
-    """Look up a channel by name or id; fall back to the request channel."""
+async def _resolve_channel(guild, current_channel, raw_name, *, fresh: bool = False):
+    """Look up a channel by name or id.
+
+    An omitted target uses the request channel.  An explicit but unknown target
+    fails closed instead of silently applying a mutation to the request channel.
+    """
     name = str(raw_name or "").strip()
-    if not name:
-        return current_channel
-    if name.isdigit():
-        ch = guild.get_channel(int(name))
-        if ch is not None:
-            return ch
-    if name.startswith("<#") and name.endswith(">"):
+    channel_id = _channel_id(name) if name else getattr(current_channel, "id", None)
+    if channel_id is None:
+        return None
+    if fresh:
         try:
-            ch = guild.get_channel(int(name[2:-1]))
-            if ch is not None:
-                return ch
-        except ValueError:
-            pass
-    name = name.lstrip("#")
-    found = discord.utils.find(
-        lambda c: c.name.lower() == name.lower(), guild.channels
+            return await guild.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return None
+    ch = guild.get_channel(channel_id)
+    if ch is not None:
+        return ch
+    return None
+
+
+def action_type(action: dict) -> Optional[str]:
+    """Return the canonical action type for an untrusted model proposal."""
+    if not isinstance(action, dict):
+        return None
+    raw_type = action.get("type") or action.get("action") or action.get("name")
+    canonical = _TYPE_ALIASES.get(str(raw_type or "").strip().lower(), raw_type)
+    return str(canonical) if canonical in _PERMS else None
+
+
+def preview_action(action: dict) -> str:
+    """Create a bounded, mention-safe summary for confirmation UI."""
+    canonical = action_type(action)
+    if canonical is None:
+        return "unknown action"
+    target = (
+        action.get("target_user")
+        or action.get("user")
+        or action.get("target")
+        or action.get("member")
+        or action.get("user_id")
+        or action.get("target_member")
     )
-    return found or current_channel
+    details = []
+    if target is not None:
+        details.append(f"target={str(target)[:80]}")
+    if action.get("channel") is not None:
+        details.append(f"channel={str(action['channel'])[:80]}")
+    role = action.get("role") or action.get("role_name")
+    if role is not None:
+        details.append(f"role={str(role)[:80]}")
+    if canonical == "purge_messages":
+        details.append(f"count={str(action.get('count') or action.get('amount') or 10)[:8]}")
+    reason = str(action.get("reason") or "").strip()
+    if reason:
+        details.append(f"reason={reason[:120]}")
+    summary = canonical + (f" ({', '.join(details)})" if details else "")
+    return discord.utils.escape_mentions(summary[:400])
 
 
 def _resolve_emoji(guild, raw) -> Optional[Union[str, discord.Emoji, discord.PartialEmoji]]:
@@ -297,7 +470,14 @@ def _resolve_emoji(guild, raw) -> Optional[Union[str, discord.Emoji, discord.Par
     return s
 
 
-async def _react_message(a: dict, guild, channel, source_message) -> Optional[str]:
+async def _react_message(
+    a: dict,
+    guild,
+    channel,
+    source_message,
+    requester=None,
+    bot_member: Optional[discord.Member] = None,
+) -> Optional[str]:
     """Add one or more emoji reactions to a message (default: the trigger msg)."""
     raw_list = []
     if a.get("emojis") is not None:
@@ -328,20 +508,45 @@ async def _react_message(a: dict, guild, channel, source_message) -> Optional[st
             return "react: bad message_id"
         ch = channel
         if a.get("channel") and guild is not None:
-            ch = _resolve_channel(guild, channel, a.get("channel")) or channel
+            ch = await _resolve_channel(
+                guild, channel, a.get("channel"), fresh=True
+            )
+            if ch is None:
+                return "react: target channel not found"
         if ch is None or not hasattr(ch, "fetch_message"):
             return "react: no channel to fetch message from"
         try:
             target_msg = await ch.fetch_message(mid_i)
         except discord.HTTPException:
             return f"react: message {mid_i} not found"
+    elif target_msg is not None and channel is not None and hasattr(channel, "fetch_message"):
+        source_id = getattr(target_msg, "id", None)
+        if source_id is not None:
+            try:
+                target_msg = await channel.fetch_message(source_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return "react: source message is no longer available"
 
     if target_msg is None:
         return "react: no message to react to"
 
     g = guild or getattr(target_msg, "guild", None)
-    me = _bot_member(g) if g is not None else None
+    me = bot_member or (_bot_member(g) if g is not None else None)
     react_ch = getattr(target_msg, "channel", channel)
+    if g is not None and isinstance(requester, discord.Member):
+        if getattr(requester.guild, "id", None) != getattr(g, "id", None):
+            return "react failed: requester is not a member of that server"
+        if react_ch is None or not hasattr(react_ch, "permissions_for"):
+            return "react failed: target channel is unavailable"
+        requester_perms = react_ch.permissions_for(requester)
+        if not (
+            requester_perms.administrator
+            or (
+                requester_perms.view_channel
+                and requester_perms.read_message_history
+            )
+        ):
+            return "react failed: you cannot view that message"
     if me is not None and react_ch is not None and hasattr(react_ch, "permissions_for"):
         bp = react_ch.permissions_for(me)
         if not (bp.add_reactions or bp.administrator):
@@ -361,8 +566,8 @@ async def _react_message(a: dict, guild, channel, source_message) -> Optional[st
             added.append(str(raw).strip())
         except discord.Forbidden:
             failed.append(f"{raw} (missing permission)")
-        except discord.HTTPException as e:
-            failed.append(f"{raw} ({e})")
+        except discord.HTTPException:
+            failed.append(f"{raw} (Discord rejected it)")
     if not added:
         return f"react failed: {'; '.join(failed) or 'unknown'}"
     if failed:
@@ -371,7 +576,14 @@ async def _react_message(a: dict, guild, channel, source_message) -> Optional[st
 
 
 async def execute_all(
-    actions, requester, guild, client, channel=None, source_message=None
+    actions,
+    requester,
+    guild,
+    client,
+    channel=None,
+    source_message=None,
+    *,
+    confirmed: bool = False,
 ) -> List[str]:
     """Run each action; return short human-readable result lines for the embed.
 
@@ -385,33 +597,69 @@ async def execute_all(
     if rid is not None and config.is_blocked(rid):
         return []
 
-    out = []
-    for a in actions or []:
-        if not isinstance(a, dict):
-            continue
+    proposals = [a for a in (actions or []) if isinstance(a, dict)]
+    if not proposals:
+        return []
+    if not confirmed:
+        return [
+            f"confirmation required — nothing executed: {preview_action(proposals[0])}"
+        ]
+    if len(proposals) > _MAX_ACTIONS_PER_CONFIRMATION:
+        return ["denied: a confirmation may execute exactly one action"]
+    if guild is None or requester is None or getattr(requester, "id", None) is None:
+        return ["denied: confirmed actions require a current guild member"]
+    try:
+        requester = await guild.fetch_member(requester.id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return ["denied: the requesting member could not be revalidated"]
+
+    bot_id = getattr(getattr(client, "user", None), "id", None)
+    if bot_id is None:
+        bot_id = getattr(_bot_member(guild), "id", None)
+    bot_member = None
+    if bot_id is not None:
         try:
-            line = await _one(a, requester, guild, client, channel, source_message)
+            bot_member = await guild.fetch_member(bot_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return ["blocked: the bot's current guild permissions could not be revalidated"]
+
+    out = []
+    for a in proposals:
+        try:
+            line = await _one(
+                a,
+                requester,
+                guild,
+                client,
+                channel,
+                source_message,
+                bot_member=bot_member,
+            )
         except discord.Forbidden:
             act_name = a.get("type") or a.get("action") or "action"
             line = f"blocked: I lack permission or role position for `{act_name}`"
-        except Exception as e:
+        except Exception:  # noqa: BLE001 - action boundary must fail closed
             act_name = a.get("type") or a.get("action") or "action"
-            line = f"failed `{act_name}`: {e}"
+            log.exception("confirmed action %s failed", act_name)
+            line = f"failed `{act_name}`; check the bot logs with the request id"
         if line:
             out.append(line)
     return out
 
 
 async def _one(
-    a: dict, requester, guild, client, channel=None, source_message=None
+    a: dict,
+    requester,
+    guild,
+    client,
+    channel=None,
+    source_message=None,
+    *,
+    bot_member: Optional[discord.Member] = None,
 ) -> Optional[str]:
-    raw_type = a.get("type") or a.get("action") or a.get("name")
-    t = _TYPE_ALIASES.get(str(raw_type or "").lower(), raw_type)
-    if t not in _PERMS:
-        return None
-
-    if t == "react_message":
-        return await _react_message(a, guild, channel, source_message)
+    t = action_type(a)
+    if t is None:
+        return "denied: unknown action"
 
     if guild is None:
         return "actions only work in a server"
@@ -428,7 +676,28 @@ async def _one(
     if requester is None or not isinstance(requester, discord.Member):
         return "actions only work in a server"
 
-    reason = str(a.get("reason") or "").strip() or f"requested via SefBot by {requester} ({requester.id})"
+    if t == "react_message":
+        requested_channel = a.get("channel")
+        if requested_channel and _channel_id(requested_channel) is None:
+            return "denied: `react_message` requires an exact channel id or mention"
+        fresh_channel = await _resolve_channel(
+            guild, channel, requested_channel, fresh=True
+        )
+        if fresh_channel is None:
+            return "react: target channel not found"
+        return await _react_message(
+            a,
+            guild,
+            fresh_channel,
+            source_message,
+            requester=requester,
+            bot_member=bot_member,
+        )
+
+    reason = (
+        str(a.get("reason") or "").strip()[:_MAX_REASON_LENGTH]
+        or f"requested via SefBot by {requester} ({requester.id})"
+    )
     raw_target = (
         a.get("target_user")
         or a.get("user")
@@ -437,19 +706,61 @@ async def _one(
         or a.get("user_id")
         or a.get("target_member")
     )
-    target = await _resolve_member(guild, raw_target, requester=requester) if raw_target else None
-    me = _bot_member(guild)
+    if t in _EXACT_MEMBER_TARGET_ACTIONS and raw_target:
+        self_target = (
+            t in {"set_nickname", "list_roles"}
+            and str(raw_target).strip().lower() in {"me", "myself", "self"}
+        )
+        if not self_target and _uid(raw_target) is None:
+            return f"denied: `{t}` requires an exact user id or mention"
+    target = (
+        await _resolve_member(
+            guild,
+            raw_target,
+            requester=requester,
+            fresh=t in _EXACT_MEMBER_TARGET_ACTIONS,
+        )
+        if raw_target
+        else None
+    )
+    me = bot_member or _bot_member(guild)
 
     _CHANNEL_SCOPED = {
-        "purge_messages", "set_slowmode", "set_channel_topic",
-        "deny_media_perms", "create_channel", "delete_channel",
+        "purge_messages",
+        "set_slowmode",
+        "set_channel_topic",
+        "deny_media_perms",
+        "delete_channel",
     }
     scope_channel = channel
+    explicit_channel = a.get("channel")
+    if t == "delete_channel":
+        explicit_channel = explicit_channel or a.get("name")
+    if (
+        t in _EXACT_CHANNEL_TARGET_ACTIONS
+        and explicit_channel
+        and _channel_id(explicit_channel) is None
+    ):
+        return f"denied: `{t}` requires an exact channel id or mention"
     if t in ("purge_messages", "set_slowmode", "set_channel_topic", "deny_media_perms"):
-        scope_channel = _resolve_channel(guild, channel, a.get("channel"))
+        scope_channel = await _resolve_channel(
+            guild, channel, a.get("channel"), fresh=True
+        )
+    elif t == "delete_channel":
+        scope_channel = await _resolve_channel(
+            guild,
+            None,
+            a.get("channel") or a.get("name"),
+            fresh=True,
+        )
 
     perm_needed = _PERMS[t]
-    if t == "set_nickname" and target and requester.id == target.id:
+    if t == "list_roles" and target is not None and target.id != requester.id:
+        perm_needed = "view_audit_log"
+    if t == "set_status":
+        if not getattr(config, "OWNER_ID", "") or str(requester.id) != str(config.OWNER_ID):
+            return "denied: changing the bot's global status is owner-only"
+    elif t == "set_nickname" and target and requester.id == target.id:
         if not (
             _has(requester, "manage_nicknames")
             or _has(requester, "change_nickname")
@@ -463,8 +774,9 @@ async def _one(
     if t == "list_roles":
         if not target:
             return f"list_roles: target user '{raw_target or ''}' not found"
-        names = [r.name for r in target.roles if r.name != "@everyone"]
-        return f"{target.display_name} roles: {', '.join(names) or 'none'}"
+        names = [r.name[:100] for r in target.roles if r.name != "@everyone"][:50]
+        rendered = f"{target.display_name} roles: {', '.join(names) or 'none'}"
+        return discord.utils.escape_mentions(rendered[:1500])
 
     if t == "kick_user":
         if not target:
@@ -473,7 +785,7 @@ async def _one(
             return "kick: won't kick yourself"
         if me is None or not (me.guild_permissions.kick_members or me.guild_permissions.administrator):
             return "blocked: I need `kick_members`"
-        err = _bot_can_act_on(guild, target) or _requester_can_act_on(requester, target)
+        err = _bot_can_act_on(guild, target, me) or _requester_can_act_on(requester, target)
         if err:
             return err
         await target.kick(reason=reason)
@@ -486,7 +798,7 @@ async def _one(
             return "ban: won't ban yourself"
         if me is None or not (me.guild_permissions.ban_members or me.guild_permissions.administrator):
             return "blocked: I need `ban_members`"
-        err = _bot_can_act_on(guild, target) or _requester_can_act_on(requester, target)
+        err = _bot_can_act_on(guild, target, me) or _requester_can_act_on(requester, target)
         if err:
             return err
         await target.ban(reason=reason, delete_message_seconds=0)
@@ -496,14 +808,22 @@ async def _one(
         if not target:
             return f"{t}: target user '{raw_target or ''}' not found"
         role_target = str(a.get("role") or a.get("role_name") or a.get("name") or "").strip()
-        role = _resolve_role(guild, role_target)
+        if _role_id(role_target) is None:
+            return f"denied: `{t}` requires an exact role id or mention"
+        role = await _resolve_role(guild, role_target, fresh=True)
         if not role:
             return f"{t}: role '{role_target}' not found"
-        err = _bot_can_manage_role(guild, role)
+        err = _bot_can_manage_role(guild, role, me)
         if err:
             return err
         if requester.guild.owner_id != requester.id and role >= requester.top_role:
             return f"denied: role `{role.name}` is at or above your top role"
+        target_err = _requester_can_act_on(requester, target)
+        if target_err:
+            return target_err
+        bot_target_err = _bot_can_act_on(guild, target, me)
+        if bot_target_err:
+            return bot_target_err
         if t == "assign_role":
             await target.add_roles(role, reason=reason)
             return f"gave {target.display_name} the {role.name} role"
@@ -523,22 +843,27 @@ async def _one(
                 colour = discord.Colour(int(hex_colour, 16))
             except ValueError:
                 pass
+        if len(name) > 100:
+            return "create_role: role name is too long"
         role = await guild.create_role(
-            name=name, colour=colour,
-            hoist=bool(a.get("hoist", False)),
-            mentionable=bool(a.get("mentionable", False)),
+            name=name,
+            colour=colour,
+            hoist=a.get("hoist") is True,
+            mentionable=a.get("mentionable") is True,
             reason=reason,
         )
         return f"created role {role.name}"
 
     if t == "delete_role":
         name = str(a.get("role") or a.get("name") or a.get("role_name") or "").strip()
-        role = _resolve_role(guild, name)
+        if _role_id(name) is None:
+            return "denied: `delete_role` requires an exact role id or mention"
+        role = await _resolve_role(guild, name, fresh=True)
         if not role:
             return f"delete_role: role '{name}' not found"
         if role.is_default():
             return "delete_role: can't delete @everyone"
-        err = _bot_can_manage_role(guild, role)
+        err = _bot_can_manage_role(guild, role, me)
         if err:
             return err
         if requester.guild.owner_id != requester.id and role >= requester.top_role:
@@ -556,7 +881,13 @@ async def _one(
                 f"dm blocked: {target.display_name} opted out of bot DMs "
                 f"(`!dmunblock` to re-enable)"
             )
-        raw = (a.get("dm_content") or a.get("message") or a.get("content") or a.get("text") or "(no content)").strip()
+        raw = str(
+            a.get("dm_content")
+            or a.get("message")
+            or a.get("content")
+            or a.get("text")
+            or "(no content)"
+        ).strip()[:_MAX_DM_LENGTH]
         header = (
             f"Message from **{requester.display_name}** "
             f"(@{requester.name}, id `{requester.id}`) via SefBot\n"
@@ -578,7 +909,7 @@ async def _one(
             return "timeout: won't timeout yourself"
         if me is None or not (me.guild_permissions.moderate_members or me.guild_permissions.administrator):
             return "blocked: I need `moderate_members`"
-        err = _bot_can_act_on(guild, target) or _requester_can_act_on(requester, target)
+        err = _bot_can_act_on(guild, target, me) or _requester_can_act_on(requester, target)
         if err:
             return err
         try:
@@ -594,7 +925,7 @@ async def _one(
             return f"remove_timeout: target user '{raw_target or ''}' not found"
         if me is None or not (me.guild_permissions.moderate_members or me.guild_permissions.administrator):
             return "blocked: I need `moderate_members`"
-        err = _bot_can_act_on(guild, target) or _requester_can_act_on(requester, target)
+        err = _bot_can_act_on(guild, target, me) or _requester_can_act_on(requester, target)
         if err:
             return err
         await target.timeout(None, reason=reason)
@@ -609,11 +940,11 @@ async def _one(
         if not (me.guild_permissions.manage_nicknames or me.guild_permissions.administrator):
             return "blocked: I need `manage_nicknames`"
         if not self_rename:
-            err = _bot_can_act_on(guild, target) or _requester_can_act_on(requester, target)
+            err = _bot_can_act_on(guild, target, me) or _requester_can_act_on(requester, target)
             if err:
                 return err
         else:
-            err = _bot_can_act_on(guild, target)
+            err = _bot_can_act_on(guild, target, me)
             if err:
                 return err
         nick = str(
@@ -641,7 +972,16 @@ async def _one(
             count = max(1, min(_MAX_PURGE, int(a.get("count") or a.get("amount") or a.get("limit") or a.get("number") or 10)))
         except (TypeError, ValueError):
             count = 10
-        purge_target = await _resolve_member(guild, a.get("target_user") or a.get("user")) if (a.get("target_user") or a.get("user")) else None
+        purge_target_raw = a.get("target_user") or a.get("user")
+        if purge_target_raw and _uid(purge_target_raw) is None:
+            return "denied: a purge target requires an exact user id or mention"
+        purge_target = (
+            await _resolve_member(guild, purge_target_raw, fresh=True)
+            if purge_target_raw
+            else None
+        )
+        if purge_target_raw and purge_target is None:
+            return "purge_messages: target user not found; nothing was deleted"
         check = (lambda m: m.author.id == purge_target.id) if purge_target else None
         deleted = await ch.purge(limit=count, check=check, reason=reason)
         return f"purged {len(deleted)} message(s) in #{getattr(ch, 'name', ch.id)}"
@@ -650,10 +990,12 @@ async def _one(
         name = str(a.get("name") or "").strip()
         if not name:
             return "create_channel: no name given"
+        if len(name) > 100:
+            return "create_channel: channel name is too long"
         if me is None or not (me.guild_permissions.manage_channels or me.guild_permissions.administrator):
             return "blocked: I need `manage_channels`"
         kind = str(a.get("channel_type") or "text").lower()
-        topic = a.get("topic") or None
+        topic = str(a.get("topic") or "")[:1024] or None
         if kind == "voice":
             ch = await guild.create_voice_channel(name, reason=reason)
         else:
@@ -662,9 +1004,7 @@ async def _one(
 
     if t == "delete_channel":
         name = str(a.get("channel") or a.get("name") or "").strip()
-        ch = _resolve_channel(guild, None, name) if name else None
-        if ch is None and name:
-            ch = discord.utils.find(lambda c: c.name.lower() == name.lstrip("#").lower(), guild.channels)
+        ch = scope_channel
         if not ch:
             return f"delete_channel: '{name}' not found"
         if me is None or not (me.guild_permissions.manage_channels or me.guild_permissions.administrator):
@@ -704,6 +1044,8 @@ async def _one(
         name = str(a.get("name") or "").strip()
         if not name:
             return "set_server_name: no name given"
+        if len(name) > 100:
+            return "set_server_name: server name is too long"
         if me is None or not (me.guild_permissions.manage_guild or me.guild_permissions.administrator):
             return "blocked: I need `manage_guild`"
         await guild.edit(name=name, reason=reason)
@@ -712,7 +1054,7 @@ async def _one(
     if t == "set_status":
         kind = _STATUS_KINDS.get(str(a.get("status_kind", "playing")).lower(),
                                  discord.ActivityType.playing)
-        text = a.get("status_text", "") or "around"
+        text = str(a.get("status_text", "") or "around")[:128]
         await client.change_presence(activity=discord.Activity(type=kind, name=text))
         return f"status set to {a.get('status_kind','playing')} {text}"
 
@@ -727,8 +1069,14 @@ async def _one(
             return "deny_media_perms: no valid channel to modify permissions"
         if me is not None and hasattr(ch, "permissions_for"):
             bp = ch.permissions_for(me)
-            if not (bp.manage_roles or bp.manage_channels or bp.administrator):
-                return f"blocked: I need `manage_roles`/`manage_channels` in #{ch.name}"
+            if not (bp.manage_roles or bp.administrator):
+                return f"blocked: I need `manage_roles` in #{ch.name}"
+        target_err = _requester_can_act_on(requester, target)
+        if target_err:
+            return target_err
+        bot_target_err = _bot_can_act_on(guild, target, me)
+        if bot_target_err:
+            return bot_target_err
         overwrite = ch.overwrites_for(target)
         overwrite.update(attach_files=False, embed_links=False)
         try:
@@ -736,7 +1084,7 @@ async def _one(
             return f"denied attach files and embed links for {target.display_name} in #{ch.name}"
         except discord.Forbidden:
             return f"denied: I lack permission to modify channel overrides for #{ch.name}"
-        except discord.HTTPException as e:
-            return f"failed to set permissions: {e}"
+        except discord.HTTPException:
+            return "failed to set permissions; Discord rejected the request"
 
     return None

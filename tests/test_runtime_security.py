@@ -1,0 +1,740 @@
+"""Security regression tests for actions, moderation, rules, and voice."""
+
+import types
+import unittest
+from unittest import mock
+
+from sefbot import actions, function_registry, moderation, rules, voice
+
+
+class ActionConfirmationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_model_actions_fail_closed_without_confirmation(self):
+        proposal = {"type": "ban_user", "user_id": "42", "reason": "test"}
+        with mock.patch.object(actions, "_one", new_callable=mock.AsyncMock) as execute:
+            result = await actions.execute_all(
+                [proposal], object(), object(), object(), confirmed=False
+            )
+        execute.assert_not_awaited()
+        self.assertIn("confirmation required", result[0])
+
+    async def test_one_confirmation_cannot_execute_multiple_actions(self):
+        proposals = [{"type": "kick_user"}, {"type": "ban_user"}]
+        with mock.patch.object(actions, "_one", new_callable=mock.AsyncMock) as execute:
+            result = await actions.execute_all(
+                proposals, object(), object(), object(), confirmed=True
+            )
+        execute.assert_not_awaited()
+        self.assertIn("exactly one", result[0])
+
+    def test_preview_canonicalizes_alias_and_suppresses_mentions(self):
+        preview = actions.preview_action(
+            {"type": "ban", "target": "@everyone", "reason": "@here"}
+        )
+        self.assertTrue(preview.startswith("ban_user"))
+        self.assertNotIn("@everyone", preview)
+        self.assertNotIn("@here", preview)
+
+    def test_role_hierarchy_blocks_equal_rank_even_for_administrator(self):
+        guild = types.SimpleNamespace(owner_id=99)
+        requester = types.SimpleNamespace(id=1, guild=guild, top_role=5)
+        target = types.SimpleNamespace(
+            id=2, guild=guild, top_role=5, display_name="peer"
+        )
+        self.assertIn("not above", actions._requester_can_act_on(requester, target))
+
+    def test_chart_url_accepts_only_bounded_data_schema(self):
+        url = actions.chart_url(
+            {
+                "type": "bar",
+                "labels": ["a", "b"],
+                "datasets": [{"label": "values", "data": [1, 2]}],
+                "plugins": {"arbitrary_callback": "ignored"},
+            }
+        )
+        self.assertTrue(url.startswith("https://quickchart.io/chart?"))
+        self.assertNotIn("arbitrary_callback", url)
+        self.assertIsNone(actions.chart_url({"type": "javascript", "labels": []}))
+
+    async def test_confirmed_action_reloads_requester_and_bot(self):
+        stale_requester = types.SimpleNamespace(id=4)
+        fresh_requester = types.SimpleNamespace(id=4)
+        fresh_bot = types.SimpleNamespace(id=100)
+        guild = types.SimpleNamespace(
+            fetch_member=mock.AsyncMock(
+                side_effect=lambda user_id: (
+                    fresh_requester if user_id == 4 else fresh_bot
+                )
+            ),
+            me=fresh_bot,
+        )
+        client = types.SimpleNamespace(user=types.SimpleNamespace(id=100))
+        with (
+            mock.patch.object(actions.config, "is_blocked", return_value=False),
+            mock.patch.object(
+                actions, "_one", new_callable=mock.AsyncMock, return_value="done"
+            ) as execute,
+        ):
+            result = await actions.execute_all(
+                [{"type": "list_roles", "user_id": "5"}],
+                stale_requester,
+                guild,
+                client,
+                confirmed=True,
+            )
+        self.assertEqual(["done"], result)
+        self.assertIs(execute.await_args.args[1], fresh_requester)
+        self.assertIs(execute.await_args.kwargs["bot_member"], fresh_bot)
+
+    async def test_fresh_member_resolution_never_uses_stale_cache(self):
+        stale = object()
+        current = object()
+        guild = types.SimpleNamespace(
+            get_member=mock.Mock(return_value=stale),
+            fetch_member=mock.AsyncMock(return_value=current),
+        )
+        resolved = await actions._resolve_member(guild, "42", fresh=True)
+        self.assertIs(resolved, current)
+        guild.get_member.assert_not_called()
+
+
+class ToolRegistryConfirmationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_mutating_tool_requires_confirmation_before_executor(self):
+        ctx = mock.Mock()
+        with mock.patch.dict(
+            function_registry._EXECUTORS,
+            {"ban_user": mock.AsyncMock(return_value="banned")},
+            clear=False,
+        ):
+            result = await function_registry.execute_tool(
+                "ban_user", {"user_id": "42"}, ctx
+            )
+            function_registry._EXECUTORS["ban_user"].assert_not_awaited()
+        self.assertIn("confirmation required", result)
+
+    async def test_confirmed_tool_reloads_actor_before_permission_check(self):
+        class FakeMember:
+            pass
+
+        guild = types.SimpleNamespace(id=1, owner_id=99)
+        stale_actor = FakeMember()
+        stale_actor.id = 4
+        fresh_actor = FakeMember()
+        fresh_actor.id = stale_actor.id
+        fresh_actor.guild = guild
+        fresh_actor.guild_permissions = types.SimpleNamespace(
+            administrator=False, ban_members=True
+        )
+        bot_member = FakeMember()
+        bot_member.guild = guild
+        bot_member.guild_permissions = types.SimpleNamespace(
+            administrator=False, ban_members=True
+        )
+        guild.me = bot_member
+        guild.fetch_member = mock.AsyncMock(return_value=fresh_actor)
+        ctx = function_registry.ActionContext(
+            guild=guild,
+            actor=stale_actor,
+            bot=types.SimpleNamespace(user=types.SimpleNamespace(id=100)),
+        )
+        executor = mock.AsyncMock(return_value="done")
+        with (
+            mock.patch.object(function_registry.discord, "Member", FakeMember),
+            mock.patch.dict(
+                function_registry._EXECUTORS, {"ban_user": executor}, clear=False
+            ),
+        ):
+            result = await function_registry.execute_tool(
+                "ban_user", {"user_id": "5"}, ctx, confirmed=True
+            )
+        self.assertEqual("done", result)
+        self.assertIs(executor.await_args.args[0].actor, fresh_actor)
+
+    def test_administrator_does_not_bypass_role_hierarchy(self):
+        class FakeMember:
+            pass
+
+        guild = types.SimpleNamespace(owner_id=1, me=None)
+        actor = FakeMember()
+        actor.id = 2
+        actor.top_role = 5
+        actor.guild_permissions = types.SimpleNamespace(administrator=True)
+        target = FakeMember()
+        target.id = 3
+        target.top_role = 5
+        target.display_name = "peer"
+        bot = types.SimpleNamespace(user=types.SimpleNamespace(id=99))
+        ctx = function_registry.ActionContext(guild=guild, actor=actor, bot=bot)
+        with mock.patch.object(function_registry.discord, "Member", FakeMember):
+            result = function_registry._hierarchy_ok(ctx, target)
+        self.assertIn("not high enough", result)
+
+    def test_model_can_propose_only_one_tool_call(self):
+        parsed = function_registry.tool_calls_from_arguments(
+            [
+                {"name": "kick_user", "arguments": "{}"},
+                {"name": "ban_user", "arguments": "{}"},
+            ]
+        )
+        self.assertEqual(["kick_user"], [call["name"] for call in parsed])
+
+    def test_audit_arguments_do_not_retain_reason_text(self):
+        audit = function_registry.audit_tool_arguments(
+            "timeout_user",
+            {"user_id": "42", "minutes": 10, "reason": "private evidence"},
+        )
+        self.assertNotIn("private evidence", str(audit))
+        self.assertEqual(
+            {
+                "tool": "timeout_user",
+                "user_id": "42",
+                "minutes": 10,
+                "reason_supplied": True,
+                "reason_length": 16,
+            },
+            audit,
+        )
+
+    async def test_non_object_tool_arguments_fail_closed(self):
+        executor = mock.AsyncMock(return_value="unexpected")
+        with mock.patch.dict(
+            function_registry._EXECUTORS, {"get_server_info": executor}, clear=False
+        ):
+            result = await function_registry.execute_tool(
+                "get_server_info", ["not", "an", "object"], mock.Mock()
+            )
+        self.assertIn("must be an object", result)
+        executor.assert_not_awaited()
+
+    async def test_server_aggregates_require_current_audit_permission(self):
+        class FakeMember:
+            pass
+
+        guild = types.SimpleNamespace(id=1, owner_id=99)
+        actor = FakeMember()
+        actor.id = 4
+        actor.guild = guild
+        actor.guild_permissions = types.SimpleNamespace(
+            administrator=False, view_audit_log=False
+        )
+        guild.fetch_member = mock.AsyncMock(return_value=actor)
+        ctx = function_registry.ActionContext(
+            guild=guild,
+            actor=actor,
+            bot=types.SimpleNamespace(user=types.SimpleNamespace(id=100)),
+        )
+        with mock.patch.object(function_registry.discord, "Member", FakeMember):
+            result = await function_registry.execute_tool(
+                "get_server_info", {}, ctx
+            )
+        self.assertIn("view_audit_log", result)
+
+
+class ReviewFirstModerationTest(unittest.IsolatedAsyncioTestCase):
+    def test_moderation_requires_exact_boolean_guild_opt_in(self):
+        for stored, expected in ((True, True), (False, False), ("true", False), (None, False)):
+            with self.subTest(stored=stored), mock.patch.object(
+                moderation.db, "guild_settings", return_value={"moderation_enabled": stored}
+            ):
+                self.assertIs(moderation._enabled_for_guild(1), expected)
+
+    def test_moderation_settings_use_canonical_guild_scope(self):
+        with mock.patch.object(
+            moderation.db,
+            "guild_settings",
+            return_value={"moderation_enabled": False},
+        ) as settings:
+            moderation._enabled_for_guild(123)
+        settings.assert_called_once_with("guild:123")
+
+    async def test_legacy_enforce_name_only_queues_review(self):
+        message = types.SimpleNamespace(delete=mock.AsyncMock())
+        with mock.patch.object(
+            moderation, "_queue_review", new_callable=mock.AsyncMock
+        ) as queue:
+            await moderation._enforce(message, {"flagged": True})
+        queue.assert_awaited_once()
+        message.delete.assert_not_awaited()
+
+    async def test_opted_out_guild_never_calls_classifier(self):
+        message = types.SimpleNamespace(
+            guild=types.SimpleNamespace(id=1),
+            author=types.SimpleNamespace(id=2, bot=False),
+            content="message",
+            id=3,
+        )
+        with (
+            mock.patch.object(moderation.config, "SAFETY_ENABLED", True),
+            mock.patch.object(moderation.config, "SAFETY_API_KEY", "configured"),
+            mock.patch.object(moderation, "_enabled_for_guild", return_value=False),
+            mock.patch.object(moderation.llm, "moderate", new_callable=mock.AsyncMock) as classify,
+        ):
+            await moderation.safety_check(message)
+        classify.assert_not_awaited()
+
+    async def test_review_delete_reloads_current_channel_permission(self):
+        class FakeMember:
+            pass
+
+        guild = types.SimpleNamespace(id=1, owner_id=99)
+        actor = FakeMember()
+        actor.id = 4
+        actor.guild = guild
+        actor.guild_permissions = types.SimpleNamespace(
+            administrator=False, manage_messages=True
+        )
+        actor.current_manage_messages = False
+        bot_member = FakeMember()
+        bot_member.id = 100
+        bot_member.guild = guild
+        bot_member.current_manage_messages = True
+        source = types.SimpleNamespace(
+            permissions_for=lambda member: types.SimpleNamespace(
+                administrator=False,
+                manage_messages=member.current_manage_messages,
+            ),
+            fetch_message=mock.AsyncMock(),
+        )
+        guild.get_channel = lambda channel_id: source
+        guild.fetch_channel = mock.AsyncMock(return_value=source)
+        guild.fetch_member = mock.AsyncMock(
+            side_effect=lambda user_id: actor if user_id == actor.id else bot_member
+        )
+        interaction = types.SimpleNamespace(
+            guild=guild,
+            user=actor,
+            client=types.SimpleNamespace(user=types.SimpleNamespace(id=100)),
+            response=types.SimpleNamespace(
+                send_message=mock.AsyncMock(), edit_message=mock.AsyncMock()
+            ),
+        )
+        review = moderation.ModerationReview(
+            guild_id=1,
+            channel_id=10,
+            message_id=11,
+            author_id=12,
+            category="test",
+            reason="test",
+            confidence=1.0,
+        )
+        with (
+            mock.patch.object(moderation.discord, "Member", FakeMember),
+            mock.patch.object(moderation, "_enabled_for_guild", return_value=True),
+        ):
+            view = moderation.ModerationReviewView(review, moderation.discord.Embed())
+            await view._finish(interaction, delete=True)
+        source.fetch_message.assert_not_awaited()
+        interaction.response.send_message.assert_awaited_once()
+        self.assertFalse(view._done)
+
+
+class RulePermissionTest(unittest.TestCase):
+    def test_rules_require_exact_boolean_guild_opt_in(self):
+        with mock.patch.object(
+            rules.db, "guild_settings", return_value={"rules_enabled": "true"}
+        ) as settings:
+            self.assertFalse(rules._enabled_for_guild(1))
+        settings.assert_called_once_with("guild:1")
+
+    def test_rule_approval_requires_action_specific_permission(self):
+        class FakeMember:
+            pass
+
+        source = types.SimpleNamespace(
+            permissions_for=lambda current: types.SimpleNamespace(
+                administrator=False,
+                view_channel=True,
+                read_message_history=True,
+                manage_messages=current.guild_permissions.manage_messages,
+            )
+        )
+        guild = types.SimpleNamespace(
+            id=1, owner_id=99, get_channel=lambda channel_id: source
+        )
+        member = FakeMember()
+        member.id = 4
+        member.guild = guild
+        member.guild_permissions = types.SimpleNamespace(
+            administrator=False,
+            manage_messages=True,
+            ban_members=False,
+            kick_members=False,
+            moderate_members=False,
+        )
+        pending = rules.PendingAction(
+            guild_id=1,
+            rule_id="test",
+            rule_name="test",
+            rule_detail="test",
+            category="ban",
+            action_label="ban",
+            offender_id=5,
+            offender_tag="target",
+            evidence="evidence",
+            channel_id=10,
+            message_id=11,
+            strikes=0,
+            warn_limit=0,
+            timeout_minutes=0,
+        )
+        with mock.patch.object(rules.discord, "Member", FakeMember):
+            self.assertFalse(rules._can_approve(guild, member, pending))
+            member.guild_permissions.ban_members = True
+            self.assertTrue(rules._can_approve(guild, member, pending))
+            source.permissions_for = lambda current: types.SimpleNamespace(
+                administrator=False,
+                view_channel=False,
+                read_message_history=False,
+                manage_messages=current.guild_permissions.manage_messages,
+            )
+            self.assertFalse(rules._can_approve(guild, member, pending))
+
+
+class RuleExecutionRevalidationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_permission_change_prevents_pending_ban(self):
+        class FakeMember:
+            pass
+
+        guild = types.SimpleNamespace(id=1, owner_id=99)
+        approver = FakeMember()
+        approver.id = 4
+        approver.guild = guild
+        approver.guild_permissions = types.SimpleNamespace(
+            administrator=False,
+            ban_members=False,
+        )
+        target = FakeMember()
+        target.id = 5
+        target.guild = guild
+        target.ban = mock.AsyncMock()
+        source = types.SimpleNamespace(
+            permissions_for=lambda _: types.SimpleNamespace(
+                administrator=False,
+                view_channel=True,
+                read_message_history=True,
+            )
+        )
+        guild.get_member = lambda user_id: approver if user_id == approver.id else None
+        async def fetch_member(user_id):
+            return approver if user_id == approver.id else target
+
+        guild.fetch_member = mock.AsyncMock(side_effect=fetch_member)
+        guild.fetch_channel = mock.AsyncMock(return_value=source)
+        guild.me = None
+        client = types.SimpleNamespace(
+            get_guild=lambda guild_id: guild,
+            user=types.SimpleNamespace(id=100),
+        )
+        pending = rules.PendingAction(
+            guild_id=1,
+            rule_id="test",
+            rule_name="test",
+            rule_detail="test",
+            category="ban",
+            action_label="ban",
+            offender_id=target.id,
+            offender_tag="target",
+            evidence="evidence",
+            channel_id=10,
+            message_id=11,
+            strikes=0,
+            warn_limit=0,
+            timeout_minutes=0,
+        )
+        with (
+            mock.patch.object(rules.discord, "Member", FakeMember),
+            mock.patch.object(rules, "_enabled_for_guild", return_value=True),
+        ):
+            result = await rules.execute_pending(client, pending, approver)
+        self.assertIn("currently needs `ban_members`", result)
+        target.ban.assert_not_awaited()
+
+    async def test_bot_permission_is_reloaded_before_pending_ban(self):
+        class FakeMember:
+            pass
+
+        guild = types.SimpleNamespace(id=1, owner_id=99)
+        approver = FakeMember()
+        approver.id = 4
+        approver.guild = guild
+        approver.top_role = 10
+        approver.guild_permissions = types.SimpleNamespace(
+            administrator=False, ban_members=True
+        )
+        target = FakeMember()
+        target.id = 5
+        target.guild = guild
+        target.top_role = 1
+        target.ban = mock.AsyncMock()
+        current_bot = FakeMember()
+        current_bot.id = 100
+        current_bot.guild = guild
+        current_bot.top_role = 10
+        current_bot.guild_permissions = types.SimpleNamespace(
+            administrator=False, ban_members=False
+        )
+        guild.me = types.SimpleNamespace(
+            top_role=10,
+            guild_permissions=types.SimpleNamespace(
+                administrator=True, ban_members=True
+            ),
+        )
+        source = types.SimpleNamespace(
+            permissions_for=lambda _: types.SimpleNamespace(
+                administrator=False,
+                view_channel=True,
+                read_message_history=True,
+            )
+        )
+
+        async def fetch_member(user_id):
+            return {4: approver, 5: target, 100: current_bot}[user_id]
+
+        guild.fetch_member = mock.AsyncMock(side_effect=fetch_member)
+        guild.fetch_channel = mock.AsyncMock(return_value=source)
+        client = types.SimpleNamespace(
+            get_guild=lambda guild_id: guild,
+            user=types.SimpleNamespace(id=100),
+        )
+        pending = rules.PendingAction(
+            guild_id=1,
+            rule_id="test",
+            rule_name="test",
+            rule_detail="test",
+            category="ban",
+            action_label="ban",
+            offender_id=target.id,
+            offender_tag="target",
+            evidence="evidence",
+            channel_id=10,
+            message_id=11,
+            strikes=0,
+            warn_limit=0,
+            timeout_minutes=0,
+        )
+        with (
+            mock.patch.object(rules.discord, "Member", FakeMember),
+            mock.patch.object(rules, "_enabled_for_guild", return_value=True),
+        ):
+            result = await rules.execute_pending(client, pending, approver)
+        self.assertIn("bot needs `ban_members`", result)
+        target.ban.assert_not_awaited()
+
+
+class VoiceConsentTest(unittest.TestCase):
+    def test_voice_settings_use_canonical_guild_scope(self):
+        with mock.patch.object(
+            voice.db,
+            "guild_settings",
+            return_value={"voice_transcription_enabled": False},
+        ) as settings:
+            self.assertFalse(voice._guild_stt_enabled(42))
+        settings.assert_called_once_with("guild:42")
+
+    def test_starting_stt_requires_manage_channels_not_manage_guild(self):
+        class FakeMember:
+            pass
+
+        guild = types.SimpleNamespace(owner_id=99)
+        member = FakeMember()
+        member.id = 1
+        member.guild = guild
+        channel = types.SimpleNamespace(
+            permissions_for=lambda _: types.SimpleNamespace(
+                administrator=False, manage_channels=False, manage_guild=True
+            )
+        )
+        with mock.patch.object(voice.discord, "Member", FakeMember):
+            self.assertFalse(voice._can_start_stt(member, channel))
+            channel.permissions_for = lambda _: types.SimpleNamespace(
+                administrator=False, manage_channels=True, manage_guild=False
+            )
+            self.assertTrue(voice._can_start_stt(member, channel))
+
+    def test_session_stops_if_controller_leaves(self):
+        class FakeMember:
+            pass
+
+        controller = FakeMember()
+        controller.id = 1
+        controller.bot = False
+        voice_channel = types.SimpleNamespace(id=7, members=[])
+        vc = types.SimpleNamespace(
+            channel=voice_channel,
+            is_connected=lambda: True,
+        )
+        destination = types.SimpleNamespace(
+            permissions_for=lambda _: types.SimpleNamespace(view_channel=True)
+        )
+        session = voice.SttSession(
+            10,
+            destination,
+            controller_id=controller.id,
+            voice_channel_id=voice_channel.id,
+            consenting_user_ids={controller.id},
+        )
+        with (
+            mock.patch.object(voice.discord, "Member", FakeMember),
+            mock.patch.object(voice.config, "STT_ENABLED", True),
+            mock.patch.object(voice, "_guild_stt_enabled", return_value=True),
+        ):
+            self.assertFalse(voice._session_is_authorized(session, vc))
+
+    def test_consent_revocation_stops_active_session(self):
+        session = voice.SttSession(7, object(), consenting_user_ids={42})
+        task = types.SimpleNamespace(
+            done=lambda: False,
+            get_loop=lambda: types.SimpleNamespace(
+                call_soon_threadsafe=lambda callback: callback()
+            ),
+            cancel=mock.Mock(),
+        )
+        session.task = task
+        session.voice_client = types.SimpleNamespace(stop_listening=mock.Mock())
+        session.sink = types.SimpleNamespace(disarm=mock.Mock())
+        voice._stt_sessions[7] = session
+        try:
+            with mock.patch.object(voice.db, "user_flag_set") as persist:
+                voice.set_stt_consent(42, 7, False)
+            persist.assert_called_once_with(
+                "42", "voice_transcription_consent:guild:7", "0"
+            )
+            self.assertTrue(session.stop_event.is_set())
+            task.cancel.assert_called_once_with()
+            session.voice_client.stop_listening.assert_called_once_with()
+            session.sink.disarm.assert_called_once_with()
+        finally:
+            voice._stt_sessions.pop(7, None)
+
+    def test_stopped_session_rejects_late_audio(self):
+        session = voice.SttSession(7, object(), consenting_user_ids={42})
+        session.stop_event.set()
+        session.enqueue(42, b"audio", 500)
+        self.assertEqual(0, session.queue.qsize())
+
+
+class VoiceWorkerRevocationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_revocation_during_provider_call_never_posts_transcript(self):
+        destination = types.SimpleNamespace(send=mock.AsyncMock())
+        session = voice.SttSession(7, destination, consenting_user_ids={42})
+        session.enqueue(42, b"wav", 500)
+        vc = types.SimpleNamespace(stop_listening=mock.Mock())
+
+        async def transcribe(*args, **kwargs):
+            session.stop_event.set()
+            return "must not be posted"
+
+        with (
+            mock.patch.object(
+                voice,
+                "_session_is_authorized",
+                side_effect=lambda current, current_vc: not current.stop_event.is_set(),
+            ),
+            mock.patch.object(voice.llm, "transcribe", side_effect=transcribe) as provider,
+        ):
+            await voice._stt_worker(session, vc)
+        provider.assert_awaited_once()
+        destination.send.assert_not_awaited()
+        self.assertEqual(0, session.queue.qsize())
+
+    async def test_recording_notice_precedes_listening(self):
+        if voice.voice_recv is None:
+            self.skipTest("discord-ext-voice-recv is unavailable")
+        events = []
+
+        class FakeMember:
+            pass
+
+        class FakeRecvClient:
+            def __init__(self, channel):
+                self.channel = channel
+                self.guild = None
+
+            def is_connected(self):
+                return True
+
+            def listen(self, sink):
+                events.append("listen")
+
+            def stop_listening(self):
+                events.append("stop")
+
+        class FakeSink:
+            def __init__(self, enqueue):
+                self.enqueue = enqueue
+
+            def disarm(self):
+                return None
+
+        controller = FakeMember()
+        controller.id = 4
+        controller.bot = False
+        controller.display_name = "controller"
+        bot_member = FakeMember()
+        bot_member.id = 100
+        bot_member.bot = True
+        voice_channel = types.SimpleNamespace(id=9, name="voice", members=[controller])
+        voice_channel.permissions_for = lambda member: types.SimpleNamespace(
+            administrator=False, manage_channels=member.id == controller.id
+        )
+        controller.voice = types.SimpleNamespace(channel=voice_channel)
+
+        notice = types.SimpleNamespace()
+
+        async def edit_notice(**kwargs):
+            events.append("notice-edit")
+
+        notice.edit = mock.AsyncMock(side_effect=edit_notice)
+        destination = types.SimpleNamespace(id=10, name="transcripts")
+
+        async def send_notice(*args, **kwargs):
+            events.append("notice")
+            return notice
+
+        destination.send = mock.AsyncMock(side_effect=send_notice)
+        destination.permissions_for = lambda member: types.SimpleNamespace(
+            administrator=False,
+            view_channel=True,
+            send_messages=member.id == bot_member.id,
+            send_messages_in_threads=False,
+        )
+        guild = types.SimpleNamespace(
+            id=1,
+            owner_id=99,
+            me=bot_member,
+            fetch_channel=mock.AsyncMock(return_value=destination),
+            fetch_member=mock.AsyncMock(
+                side_effect=lambda user_id: (
+                    controller if user_id == controller.id else bot_member
+                )
+            ),
+        )
+        destination.guild = guild
+        controller.guild = guild
+        bot_member.guild = guild
+        vc = FakeRecvClient(voice_channel)
+        vc.guild = guild
+        guild.voice_client = vc
+        interaction = types.SimpleNamespace(
+            guild=guild,
+            user=controller,
+            channel=destination,
+        )
+
+        with (
+            mock.patch.object(voice.discord, "Member", FakeMember),
+            mock.patch.object(
+                voice.voice_recv, "VoiceRecvClient", FakeRecvClient
+            ),
+            mock.patch.object(voice, "UtteranceSink", FakeSink),
+            mock.patch.object(voice.config, "STT_ENABLED", True),
+            mock.patch.object(voice.config, "GROQ_API_KEY", "configured"),
+            mock.patch.object(voice, "_guild_stt_enabled", return_value=True),
+        ):
+            ok, _message = await voice._toggle_stt_locked(interaction)
+            self.assertTrue(ok)
+            self.assertLess(events.index("notice"), events.index("listen"))
+            await voice._stop_stt_session(guild.id, vc)
+
+
+if __name__ == "__main__":
+    unittest.main()

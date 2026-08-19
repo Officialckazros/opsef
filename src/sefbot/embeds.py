@@ -2,6 +2,7 @@
 is run through de_emoji() so the bot never emits emoji (per design)."""
 import datetime
 import re
+from urllib.parse import urlsplit
 
 import discord
 
@@ -46,6 +47,50 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _markdown_label(text: str) -> str:
+    return re.sub(r"([\\\[\]\(\)])", r"\\\1", de_emoji(text or "source"))
+
+
+def _safe_url(value: str) -> str | None:
+    try:
+        parsed = urlsplit(str(value or ""))
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    if parsed.username or parsed.password:
+        return None
+    return str(value)
+
+
+def fit_total(embed: discord.Embed, maximum: int = 6000) -> discord.Embed:
+    """Keep an embed under Discord's aggregate character limit."""
+    overflow = len(embed) - maximum
+    if overflow <= 0:
+        return embed
+    if embed.description:
+        keep = max(0, len(embed.description) - overflow - 1)
+        embed.description = _clip(embed.description, keep) if keep else None
+    while len(embed) > maximum and embed.fields:
+        fields = list(embed.fields)
+        last = fields[-1]
+        overflow = len(embed) - maximum
+        keep = max(0, len(last.value) - overflow - 1)
+        if keep:
+            embed.set_field_at(
+                len(fields) - 1,
+                name=last.name,
+                value=_clip(last.value, keep),
+                inline=last.inline,
+            )
+            break
+        embed.remove_field(len(fields) - 1)
+    if len(embed) > maximum and embed.footer.text:
+        overflow = len(embed) - maximum
+        embed.set_footer(text=_clip(embed.footer.text, max(1, len(embed.footer.text) - overflow)))
+    return embed
+
+
 def say(description: str, title: str = None, color: int = None,
         image: str = None, footer: str = None) -> discord.Embed:
     e = discord.Embed(
@@ -57,7 +102,7 @@ def say(description: str, title: str = None, color: int = None,
         e.set_image(url=image)
     if footer:
         e.set_footer(text=_clip(de_emoji(footer), 2048))
-    return e
+    return fit_total(e)
 
 
 def error(description: str) -> discord.Embed:
@@ -81,20 +126,20 @@ def add_support_resources(embed: discord.Embed) -> discord.Embed:
         ),
         inline=False,
     )
-    return embed
+    return fit_total(embed)
 
 
 def add_sources(embed: discord.Embed, sources: list) -> discord.Embed:
     """Append just a clickable sources list (answer already woven into the reply)."""
     links = []
     for i, s in enumerate(sources or [], 1):
-        title = de_emoji(s.get("title") or s.get("url") or "source")[:70]
-        url = s.get("url")
+        title = _markdown_label(s.get("title") or s.get("url") or "source")[:70]
+        url = _safe_url(s.get("url"))
         if url:
             links.append(f"{i}. [{title}]({url})")
     if links:
         embed.add_field(name="sources", value=_clip("\n".join(links), 1024), inline=False)
-    return embed
+    return fit_total(embed)
 
 
 def add_search(embed: discord.Embed, res: dict) -> discord.Embed:
@@ -104,13 +149,13 @@ def add_search(embed: discord.Embed, res: dict) -> discord.Embed:
         embed.add_field(name="from the web", value=_clip(de_emoji(ans), 1024), inline=False)
     links = []
     for i, s in enumerate((res or {}).get("sources") or [], 1):
-        title = de_emoji(s.get("title") or s.get("url") or "source")[:70]
-        url = s.get("url")
+        title = _markdown_label(s.get("title") or s.get("url") or "source")[:70]
+        url = _safe_url(s.get("url"))
         if url:
             links.append(f"{i}. [{title}]({url})")
     if links:
         embed.add_field(name="sources", value=_clip("\n".join(links), 1024), inline=False)
-    return embed
+    return fit_total(embed)
 
 
 def search(query: str, answer: str, sources: list) -> discord.Embed:
@@ -120,10 +165,10 @@ def search(query: str, answer: str, sources: list) -> discord.Embed:
         e.set_footer(text=_clip(de_emoji(f"searched: {query}"), 2048))
     links = []
     for i, s in enumerate(sources or [], 1):
-        title = de_emoji(s.get("title") or s.get("url") or "source")[:80]
-        url = s.get("url")
+        title = _markdown_label(s.get("title") or s.get("url") or "source")[:80]
+        url = _safe_url(s.get("url"))
         if url:
             links.append(f"{i}. [{title}]({url})")
     if links:
         e.add_field(name="sources", value=_clip("\n".join(links), 1024), inline=False)
-    return e
+    return fit_total(e)

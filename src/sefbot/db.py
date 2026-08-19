@@ -14,18 +14,58 @@ quotes        : hall of shame / saved lines
 guild_settings: per-server config (persona, lurk, etc.)
 """
 import json
+import math
+import os
 import re
 import sqlite3
+import threading
 import time
+from pathlib import Path
 from typing import List, Optional
 
 from sefbot import config
+from sefbot.scope import is_dm_scope, is_guild_scope
+
+LATEST_SCHEMA_VERSION = 4
+MAX_RETENTION_DAYS = 30
+_db_lock = threading.RLock()
+
+
+class _SerializedConnection(sqlite3.Connection):
+    """Serialize access while legacy synchronous callers are migrated.
+
+    sqlite is safe with WAL, but one ``check_same_thread=False`` connection is
+    not safe to use concurrently without application-level serialization.
+    Important multi-statement operations below additionally hold ``_db_lock``
+    for their complete transaction.
+    """
+
+    def execute(self, *args, **kwargs):
+        with _db_lock:
+            return super().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        with _db_lock:
+            return super().executemany(*args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        with _db_lock:
+            return super().executescript(*args, **kwargs)
+
+    def commit(self):
+        with _db_lock:
+            return super().commit()
+
+    def rollback(self):
+        with _db_lock:
+            return super().rollback()
+
 
 _conn: Optional[sqlite3.Connection] = None
 
 _gs_cache: dict = {}
 _GS_TTL = 5.0
-_lessons_cache: Optional[list] = None
+_lessons_cache: Optional[dict[str, list]] = None
 _lessons_ts: float = 0.0
 _LESSONS_TTL = 30.0
 _mem_cache: dict = {}
@@ -46,6 +86,19 @@ def _mem_cache_get(key):
     return None
 
 
+def _invalidate_memory_cache(*, subject: str | None = None, scope_id: str | None = None) -> None:
+    """Evict every cache entry that could contain a mutated memory."""
+    for key in list(_mem_cache):
+        kind = key[0] if key else None
+        if kind == "about" and subject is not None and key[1] != subject:
+            continue
+        if scope_id is not None:
+            cached_scope = key[2] if kind == "about" else key[1] if kind == "scope" else None
+            if cached_scope != scope_id:
+                continue
+        _mem_cache.pop(key, None)
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,7 +114,9 @@ CREATE TABLE IF NOT EXISTS lessons (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     content   TEXT NOT NULL UNIQUE,
     source    TEXT,
-    created   REAL NOT NULL
+    created   REAL NOT NULL,
+    scope_id  TEXT,
+    enabled   INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS feedback (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,7 +126,8 @@ CREATE TABLE IF NOT EXISTS feedback (
     note       TEXT,
     author     TEXT,
     processed  INTEGER DEFAULT 0,
-    created    REAL NOT NULL
+    created    REAL NOT NULL,
+    scope_id   TEXT
 );
 CREATE TABLE IF NOT EXISTS commands (
     name        TEXT PRIMARY KEY,
@@ -138,96 +194,740 @@ CREATE TABLE IF NOT EXISTS server_messages (
     bad_words_found  TEXT,
     created          REAL NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(subject, guild_id);
+CREATE TABLE IF NOT EXISTS privacy_consents (
+    user_id    TEXT NOT NULL,
+    scope_id   TEXT NOT NULL,
+    opted_in   INTEGER NOT NULL DEFAULT 0,
+    updated    REAL NOT NULL,
+    PRIMARY KEY (user_id, scope_id)
+);
+CREATE TABLE IF NOT EXISTS action_audit (
+    nonce          TEXT PRIMARY KEY,
+    actor_id       TEXT NOT NULL,
+    scope_id       TEXT NOT NULL,
+    action         TEXT NOT NULL,
+    target_id      TEXT,
+    parameters     TEXT NOT NULL DEFAULT '{}',
+    source         TEXT NOT NULL,
+    correlation_id TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    result         TEXT,
+    created        REAL NOT NULL,
+    completed      REAL
+);
+CREATE TABLE IF NOT EXISTS economy_accounts (
+    user_id    TEXT PRIMARY KEY,
+    balance    INTEGER NOT NULL DEFAULT 0 CHECK(balance >= 0),
+    deposit    INTEGER NOT NULL DEFAULT 0 CHECK(deposit >= 0),
+    updated    REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS work_cooldowns (
+    user_id    TEXT PRIMARY KEY,
+    last_work  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS state_migrations (
+    name        TEXT PRIMARY KEY,
+    migrated_at REAL NOT NULL,
+    details     TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS dynamic_blocks (
+    user_id      TEXT PRIMARY KEY,
+    block_source TEXT NOT NULL CHECK(block_source IN ('manual', 'tos', 'other')),
+    metadata     TEXT NOT NULL,
+    blocked_at   REAL NOT NULL,
+    updated_at   REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dm_contacts (
+    user_id         TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    last_message_at TEXT NOT NULL,
+    updated_at      REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cli_active_conversations (
+    user_id    TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    heartbeat  REAL NOT NULL,
+    PRIMARY KEY (user_id, session_id)
+);
 CREATE INDEX IF NOT EXISTS idx_convo_user ON conversations(user_id, guild_id, created);
 CREATE INDEX IF NOT EXISTS idx_quotes_guild ON quotes(guild_id);
 CREATE INDEX IF NOT EXISTS idx_msg_guild_user ON server_messages(guild_id, user_id, created);
 CREATE INDEX IF NOT EXISTS idx_msg_user ON server_messages(user_id, created);
 CREATE INDEX IF NOT EXISTS idx_msg_bad ON server_messages(guild_id, has_bad_words);
+CREATE INDEX IF NOT EXISTS idx_msg_created ON server_messages(created);
+CREATE INDEX IF NOT EXISTS idx_cli_active_heartbeat
+    ON cli_active_conversations(heartbeat);
 """
 
 _WORD = re.compile(r"[a-z0-9]{3,}")
 
 
+def _table_columns(c: sqlite3.Connection, table: str) -> set[str]:
+    return {str(r["name"]) for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _canonical_scope(raw: object, fallback_user: object | None = None) -> Optional[str]:
+    value = str(raw or "").strip()
+    if is_guild_scope(value) or is_dm_scope(value):
+        return value
+    if value.isdigit():
+        return f"guild:{value}"
+    if value == "dm" and str(fallback_user or "").isdigit():
+        return f"dm:{fallback_user}"
+    return None
+
+
+def _logical_backup(c: sqlite3.Connection) -> None:
+    """Back up only data the privacy migration is allowed to preserve."""
+    if config.DB_PATH == ":memory:":
+        return
+    target = Path(f"{config.DB_PATH}.migration-preserved.json")
+    payload = {
+        "schema": 1,
+        "created": time.time(),
+        "memories": [dict(r) for r in c.execute("SELECT * FROM memories").fetchall()],
+        "guild_settings": [dict(r) for r in c.execute("SELECT * FROM guild_settings").fetchall()],
+        "relationships": [dict(r) for r in c.execute("SELECT * FROM relationships").fetchall()],
+    }
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+        os.chmod(target, 0o600)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _tighten_database_permissions() -> None:
+    """Keep the database and SQLite sidecars owner-readable only."""
+    if config.DB_PATH == ":memory:":
+        return
+    base = Path(config.DB_PATH)
+    for candidate in (base, Path(f"{base}-wal"), Path(f"{base}-shm")):
+        try:
+            if candidate.is_file() and not candidate.is_symlink():
+                os.chmod(candidate, 0o600)
+        except OSError:
+            # Startup validation/integrity still decides whether the database
+            # is usable; permission warnings are handled by config startup.
+            pass
+
+
+def _rescope_legacy_rows(c: sqlite3.Connection) -> None:
+    # Explicit memories can be safely assigned only when a guild id or DM
+    # subject/author identifies their original tenant.
+    for row in c.execute("SELECT id,guild_id,author,subject FROM memories").fetchall():
+        fallback = row["subject"] if str(row["subject"] or "").isdigit() else row["author"]
+        scope = _canonical_scope(row["guild_id"], fallback)
+        if scope:
+            c.execute("UPDATE memories SET guild_id=? WHERE id=?", (scope, row["id"]))
+        else:
+            c.execute("DELETE FROM memories WHERE id=?", (row["id"],))
+
+    for row in c.execute(
+        "SELECT user_id,guild_id FROM relationships"
+    ).fetchall():
+        original_scope = row["guild_id"]
+        scope = _canonical_scope(original_scope, row["user_id"])
+        if scope:
+            c.execute(
+                "UPDATE relationships SET guild_id=? WHERE user_id=? AND guild_id=?",
+                (scope, row["user_id"], original_scope),
+            )
+        else:
+            c.execute(
+                "DELETE FROM relationships WHERE user_id=? AND guild_id=?",
+                (row["user_id"], original_scope),
+            )
+
+    for row in c.execute("SELECT id,guild_id,user_id FROM conversations").fetchall():
+        scope = _canonical_scope(row["guild_id"], row["user_id"])
+        if scope:
+            c.execute(
+                "UPDATE conversations SET guild_id=? WHERE id=?",
+                (scope, row["id"]),
+            )
+        else:
+            c.execute("DELETE FROM conversations WHERE id=?", (row["id"],))
+
+    for row in c.execute("SELECT id,guild_id,author FROM interactions").fetchall():
+        scope = _canonical_scope(row["guild_id"], row["author"])
+        if scope:
+            c.execute(
+                "UPDATE interactions SET guild_id=? WHERE id=?",
+                (scope, row["id"]),
+            )
+        else:
+            c.execute("DELETE FROM interactions WHERE id=?", (row["id"],))
+
+    for row in c.execute("SELECT id,guild_id FROM quotes").fetchall():
+        scope = _canonical_scope(row["guild_id"])
+        if scope and is_guild_scope(scope):
+            c.execute("UPDATE quotes SET guild_id=? WHERE id=?", (scope, row["id"]))
+        else:
+            c.execute("DELETE FROM quotes WHERE id=?", (row["id"],))
+
+    for row in c.execute("SELECT guild_id,data FROM guild_settings").fetchall():
+        scope = _canonical_scope(row["guild_id"])
+        if not scope or not is_guild_scope(scope):
+            c.execute("DELETE FROM guild_settings WHERE guild_id=?", (row["guild_id"],))
+            continue
+        if scope != row["guild_id"]:
+            c.execute(
+                "INSERT OR REPLACE INTO guild_settings(guild_id,data) VALUES(?,?)",
+                (scope, row["data"]),
+            )
+            c.execute("DELETE FROM guild_settings WHERE guild_id=?", (row["guild_id"],))
+
+    # Command names used to be global primary keys.  Rebuild with a composite
+    # tenant key and keep ambiguous rows disabled for explicit owner review.
+    c.execute("DROP TABLE IF EXISTS commands_v3")
+    c.execute(
+        "CREATE TABLE commands_v3 ("
+        "scope_id TEXT NOT NULL,name TEXT NOT NULL,description TEXT NOT NULL,"
+        "behavior TEXT NOT NULL,author TEXT,uses INTEGER DEFAULT 0,created REAL NOT NULL,"
+        "enabled INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(scope_id,name))"
+    )
+    for row in c.execute("SELECT * FROM commands").fetchall():
+        scope = _canonical_scope(row["guild_id"], row["author"])
+        enabled = 1 if scope else 0
+        c.execute(
+            "INSERT OR REPLACE INTO commands_v3 VALUES(?,?,?,?,?,?,?,?)",
+            (
+                scope or "legacy:disabled",
+                row["name"], row["description"], row["behavior"], row["author"],
+                row["uses"], row["created"], enabled,
+            ),
+        )
+    c.execute("DROP TABLE commands")
+    c.execute("ALTER TABLE commands_v3 RENAME TO commands")
+
+
 def _migrate(c: sqlite3.Connection) -> None:
-    """Additive migrations so an already-deployed DB upgrades in place."""
-    cols = {r["name"] for r in c.execute("PRAGMA table_info(memories)").fetchall()}
-    if "subject" not in cols:
-        c.execute("ALTER TABLE memories ADD COLUMN subject TEXT NOT NULL DEFAULT 'server'")
-    if "importance" not in cols:
-        c.execute("ALTER TABLE memories ADD COLUMN importance REAL DEFAULT 0.5")
-    if "updated" not in cols:
-        c.execute("ALTER TABLE memories ADD COLUMN updated REAL")
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS relationships (
-        user_id    TEXT NOT NULL,
-        guild_id   TEXT NOT NULL,
-        score      REAL NOT NULL DEFAULT 0.0,
-        nickname   TEXT,
-        grudge     TEXT,
-        bond_label TEXT DEFAULT 'stranger',
-        updated    REAL NOT NULL,
-        PRIMARY KEY (user_id, guild_id)
-    );
-    CREATE TABLE IF NOT EXISTS conversations (
-        id       INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id  TEXT NOT NULL,
-        guild_id TEXT NOT NULL,
-        role     TEXT NOT NULL,
-        content  TEXT NOT NULL,
-        created  REAL NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS quotes (
-        id       INTEGER PRIMARY KEY AUTOINCREMENT,
-        guild_id TEXT NOT NULL,
-        text     TEXT NOT NULL,
-        about    TEXT,
-        author   TEXT,
-        created  REAL NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS guild_settings (
-        guild_id TEXT PRIMARY KEY,
-        data     TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS server_messages (
-        id               INTEGER PRIMARY KEY AUTOINCREMENT,
-        message_id       TEXT UNIQUE,
-        guild_id         TEXT NOT NULL,
-        guild_name       TEXT,
-        channel_id       TEXT NOT NULL,
-        channel_name     TEXT,
-        user_id          TEXT NOT NULL,
-        username         TEXT NOT NULL,
-        display_name     TEXT,
-        content          TEXT NOT NULL,
-        has_bad_words    INTEGER DEFAULT 0,
-        bad_words_found  TEXT,
-        created          REAL NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(subject, guild_id);
-    CREATE INDEX IF NOT EXISTS idx_convo_user ON conversations(user_id, guild_id, created);
-    CREATE INDEX IF NOT EXISTS idx_quotes_guild ON quotes(guild_id);
-    CREATE INDEX IF NOT EXISTS idx_msg_guild_user ON server_messages(guild_id, user_id, created);
-    CREATE INDEX IF NOT EXISTS idx_msg_user ON server_messages(user_id, created);
-    CREATE INDEX IF NOT EXISTS idx_msg_bad ON server_messages(guild_id, has_bad_words);
-    """)
-    c.execute("DROP TABLE IF EXISTS user_geo")
-    c.execute("DROP TABLE IF EXISTS geo_tokens")
-    c.commit()
+    """Transactional, versioned migrations for existing deployments."""
+    with _db_lock:
+        version = int(c.execute("PRAGMA user_version").fetchone()[0])
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            cols = _table_columns(c, "memories")
+            if "subject" not in cols:
+                c.execute("ALTER TABLE memories ADD COLUMN subject TEXT NOT NULL DEFAULT 'server'")
+            if "importance" not in cols:
+                c.execute("ALTER TABLE memories ADD COLUMN importance REAL DEFAULT 0.5")
+            if "updated" not in cols:
+                c.execute("ALTER TABLE memories ADD COLUMN updated REAL")
+
+            lesson_cols = _table_columns(c, "lessons")
+            if "scope_id" not in lesson_cols:
+                c.execute("ALTER TABLE lessons ADD COLUMN scope_id TEXT")
+            if "enabled" not in lesson_cols:
+                c.execute("ALTER TABLE lessons ADD COLUMN enabled INTEGER NOT NULL DEFAULT 0")
+            feedback_cols = _table_columns(c, "feedback")
+            if "scope_id" not in feedback_cols:
+                c.execute("ALTER TABLE feedback ADD COLUMN scope_id TEXT")
+
+            c.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mem_subject ON memories(subject,guild_id)"
+            )
+
+            # Version 3 was the destructive privacy cut-over.  Later schema
+            # additions must never replay it: commands no longer even have
+            # the legacy ``guild_id`` column after this migration.
+            if version < 3:
+                _logical_backup(c)
+                _rescope_legacy_rows(c)
+                # The user explicitly selected a clean privacy cut-over.
+                c.execute("DELETE FROM server_messages")
+                c.execute("UPDATE lessons SET enabled=0 WHERE scope_id IS NULL OR scope_id='' ")
+
+            c.execute("CREATE INDEX IF NOT EXISTS idx_feedback_scope ON feedback(scope_id,author)")
+            c.execute("DROP TABLE IF EXISTS user_geo")
+            c.execute("DROP TABLE IF EXISTS geo_tokens")
+            c.execute(f"PRAGMA user_version={LATEST_SCHEMA_VERSION}")
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
 
 
 def conn() -> sqlite3.Connection:
     global _conn
-    if _conn is None:
-        _conn = sqlite3.connect(config.DB_PATH, check_same_thread=False, timeout=30.0)
-        _conn.row_factory = sqlite3.Row
-        _conn.execute("PRAGMA journal_mode=WAL;")
-        _conn.execute("PRAGMA synchronous=NORMAL;")
-        _conn.execute("PRAGMA busy_timeout=30000;")
-        _conn.executescript(SCHEMA)
-        _conn.commit()
-        _migrate(_conn)
+    if _conn is not None:
+        return _conn
+    with _db_lock:
+        if _conn is not None:
+            return _conn
+        db_path = Path(config.DB_PATH)
+        if config.DB_PATH != ":memory:":
+            # A newly created private state directory must not inherit a
+            # permissive process umask. Existing directories are never chmod'd
+            # here because the configured database may intentionally live in
+            # a repository or another shared parent.
+            db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        candidate = sqlite3.connect(
+            config.DB_PATH,
+            check_same_thread=False,
+            timeout=30.0,
+            factory=_SerializedConnection,
+        )
+        try:
+            candidate.row_factory = sqlite3.Row
+            candidate.execute("PRAGMA journal_mode=WAL;")
+            candidate.execute("PRAGMA synchronous=NORMAL;")
+            candidate.execute("PRAGMA busy_timeout=30000;")
+            candidate.execute("PRAGMA foreign_keys=ON;")
+            candidate.executescript(SCHEMA)
+            candidate.commit()
+            _migrate(candidate)
+        except Exception:
+            candidate.close()
+            raise
+        _conn = candidate
+        if config.DB_PATH != ":memory:":
+            _tighten_database_permissions()
     return _conn
+
+
+def close() -> None:
+    """Close the process-owned database connection."""
+    global _conn
+    with _db_lock:
+        if _conn is not None:
+            _conn.close()
+            _conn = None
+        _gs_cache.clear()
+        _mem_cache.clear()
+
+
+def integrity_check() -> None:
+    """Fail startup if SQLite reports corruption."""
+    rows = conn().execute("PRAGMA integrity_check").fetchall()
+    results = [str(row[0]) for row in rows]
+    if results != ["ok"]:
+        raise RuntimeError("database integrity check failed")
+
+
+def _json_dict(raw: object) -> dict:
+    """Decode an object stored in SQLite without trusting its shape."""
+    if isinstance(raw, dict):
+        return dict(raw)
+    try:
+        value = json.loads(str(raw or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _migration_exists(c: sqlite3.Connection, name: str) -> bool:
+    return c.execute(
+        "SELECT 1 FROM state_migrations WHERE name=?", (str(name),)
+    ).fetchone() is not None
+
+
+def legacy_state_migrated(name: str) -> bool:
+    """Return whether a named one-shot legacy state import has committed."""
+    return _migration_exists(conn(), str(name))
+
+
+def import_legacy_dynamic_blocks(
+    migration_name: str,
+    records: list[tuple[str, str, dict]],
+) -> bool:
+    """Import legacy block records once, without replacing live SQLite data.
+
+    Returns ``True`` only for the process that committed the migration marker.
+    The marker and all imported rows are in the same transaction, which makes
+    concurrent bot/CLI startup safe and keeps a partial import from becoming
+    authoritative.
+    """
+    c = conn()
+    with _db_lock:
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            if _migration_exists(c, migration_name):
+                c.rollback()
+                return False
+            imported = 0
+            for user_id, block_source, metadata in records:
+                source = block_source if block_source in {"manual", "tos", "other"} else "other"
+                clean = dict(metadata) if isinstance(metadata, dict) else {}
+                blocked_at = _safe_timestamp(clean.get("blocked_at"), now())
+                updated_at = _safe_timestamp(clean.get("updated_at"), blocked_at)
+                clean["blocked_at"] = blocked_at
+                clean["updated_at"] = updated_at
+                clean["source"] = source
+                cur = c.execute(
+                    "INSERT OR IGNORE INTO dynamic_blocks"
+                    "(user_id,block_source,metadata,blocked_at,updated_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (
+                        str(user_id), source,
+                        json.dumps(clean, ensure_ascii=False, sort_keys=True),
+                        blocked_at, updated_at,
+                    ),
+                )
+                imported += max(0, int(cur.rowcount))
+            c.execute(
+                "INSERT INTO state_migrations(name,migrated_at,details) VALUES(?,?,?)",
+                (
+                    str(migration_name), now(),
+                    json.dumps({"records": imported}, sort_keys=True),
+                ),
+            )
+            c.commit()
+            return True
+        except Exception:
+            c.rollback()
+            raise
+
+
+def dynamic_block_apply(
+    user_id: str,
+    *,
+    block_source: str,
+    fields: dict,
+    history_event: dict,
+) -> bool:
+    """Atomically create/update one dynamic block and append its history.
+
+    Manual blocks dominate automatic ToS blocks.  An automatic event may be
+    recorded against a manually blocked account, but it cannot silently turn
+    that entry into a ToS block that the ToS-review CLI is allowed to remove.
+    """
+    uid = str(user_id)
+    incoming_source = (
+        block_source if block_source in {"manual", "tos", "other"} else "other"
+    )
+    c = conn()
+    with _db_lock:
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute(
+                "SELECT block_source,metadata,blocked_at FROM dynamic_blocks "
+                "WHERE user_id=?",
+                (uid,),
+            ).fetchone()
+            timestamp = now()
+            newly_blocked = row is None
+            if row is None:
+                source = incoming_source
+                metadata: dict = {}
+                blocked_at = timestamp
+            else:
+                old_source = str(row["block_source"] or "other")
+                source = (
+                    "manual"
+                    if "manual" in {old_source, incoming_source}
+                    else incoming_source
+                )
+                metadata = _json_dict(row["metadata"])
+                blocked_at = _safe_timestamp(row["blocked_at"], timestamp)
+
+            # Never let an automatic update rewrite the visible reason/source
+            # of an existing manual block.  It is still retained in history.
+            preserve_manual = (
+                row is not None
+                and str(row["block_source"] or "") == "manual"
+                and incoming_source != "manual"
+            )
+            if not preserve_manual:
+                for key, value in fields.items():
+                    if value not in (None, "") or key in {"reason", "offending_text"}:
+                        metadata[str(key)] = value
+
+            history = metadata.get("history")
+            if not isinstance(history, list):
+                history = []
+            event = dict(history_event) if isinstance(history_event, dict) else {}
+            event["block_source"] = incoming_source
+            history.append(event)
+            metadata["history"] = history[-10:]
+            metadata["blocked_at"] = blocked_at
+            metadata["updated_at"] = timestamp
+            metadata["source"] = source
+
+            c.execute(
+                "INSERT INTO dynamic_blocks"
+                "(user_id,block_source,metadata,blocked_at,updated_at) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
+                "block_source=excluded.block_source,metadata=excluded.metadata,"
+                "blocked_at=excluded.blocked_at,updated_at=excluded.updated_at",
+                (
+                    uid, source,
+                    json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                    blocked_at, timestamp,
+                ),
+            )
+            c.commit()
+            return newly_blocked
+        except Exception:
+            c.rollback()
+            raise
+
+
+def dynamic_block_remove(
+    user_id: str, *, expected_sources: set[str] | None = None
+) -> bool:
+    """Atomically remove a block, optionally only if its source still matches."""
+    uid = str(user_id)
+    c = conn()
+    with _db_lock:
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            if expected_sources is None:
+                cur = c.execute("DELETE FROM dynamic_blocks WHERE user_id=?", (uid,))
+            else:
+                allowed = {
+                    value
+                    for value in expected_sources
+                    if value in {"manual", "tos", "other"}
+                }
+                if not allowed:
+                    c.rollback()
+                    return False
+                row = c.execute(
+                    "SELECT block_source FROM dynamic_blocks WHERE user_id=?",
+                    (uid,),
+                ).fetchone()
+                if row is None or str(row["block_source"]) not in allowed:
+                    c.rollback()
+                    return False
+                cur = c.execute(
+                    "DELETE FROM dynamic_blocks WHERE user_id=? AND block_source=?",
+                    (uid, str(row["block_source"])),
+                )
+            removed = int(cur.rowcount) > 0
+            c.commit()
+            return removed
+        except Exception:
+            c.rollback()
+            raise
+
+
+def dynamic_block_get(user_id: str) -> dict | None:
+    row = conn().execute(
+        "SELECT block_source,metadata,blocked_at,updated_at FROM dynamic_blocks "
+        "WHERE user_id=?",
+        (str(user_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    metadata = _json_dict(row["metadata"])
+    metadata["source"] = str(row["block_source"])
+    metadata["blocked_at"] = float(row["blocked_at"])
+    metadata["updated_at"] = float(row["updated_at"])
+    return metadata
+
+
+def dynamic_blocks_all() -> dict[str, dict]:
+    rows = conn().execute(
+        "SELECT user_id,block_source,metadata,blocked_at,updated_at "
+        "FROM dynamic_blocks ORDER BY user_id"
+    ).fetchall()
+    result: dict[str, dict] = {}
+    for row in rows:
+        metadata = _json_dict(row["metadata"])
+        metadata["source"] = str(row["block_source"])
+        metadata["blocked_at"] = float(row["blocked_at"])
+        metadata["updated_at"] = float(row["updated_at"])
+        result[str(row["user_id"])] = metadata
+    return result
+
+
+def _safe_timestamp(value: object, default: float) -> float:
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return float(default)
+    if not (0 <= timestamp <= now() + 86_400):
+        return float(default)
+    return timestamp
+
+
+def import_legacy_dm_contacts(
+    migration_name: str, records: list[tuple[str, str, str]]
+) -> bool:
+    """Import legacy DM contacts exactly once without overwriting live rows."""
+    c = conn()
+    with _db_lock:
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            if _migration_exists(c, migration_name):
+                c.rollback()
+                return False
+            imported = 0
+            for user_id, name, last_message_at in records:
+                cur = c.execute(
+                    "INSERT OR IGNORE INTO dm_contacts"
+                    "(user_id,name,last_message_at,updated_at) VALUES(?,?,?,?)",
+                    (str(user_id), str(name), str(last_message_at), now()),
+                )
+                imported += max(0, int(cur.rowcount))
+            c.execute(
+                "INSERT INTO state_migrations(name,migrated_at,details) VALUES(?,?,?)",
+                (
+                    str(migration_name), now(),
+                    json.dumps({"records": imported}, sort_keys=True),
+                ),
+            )
+            c.commit()
+            return True
+        except Exception:
+            c.rollback()
+            raise
+
+
+def dm_contacts_upsert(records: list[tuple[str, str, str]]) -> None:
+    """Upsert contacts atomically, refusing to replace a newer contact row."""
+    if not records:
+        return
+    c = conn()
+    with _db_lock:
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            timestamp = now()
+            c.executemany(
+                "INSERT INTO dm_contacts(user_id,name,last_message_at,updated_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
+                "name=excluded.name,last_message_at=excluded.last_message_at,"
+                "updated_at=excluded.updated_at "
+                "WHERE excluded.last_message_at >= dm_contacts.last_message_at",
+                [
+                    (str(uid), str(name), str(last_message_at), timestamp)
+                    for uid, name, last_message_at in records
+                ],
+            )
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+
+
+def dm_contacts_all() -> dict[str, dict]:
+    rows = conn().execute(
+        "SELECT user_id,name,last_message_at FROM dm_contacts "
+        "ORDER BY last_message_at DESC,user_id"
+    ).fetchall()
+    return {
+        str(row["user_id"]): {
+            "name": str(row["name"]),
+            "last_message_at": str(row["last_message_at"]),
+        }
+        for row in rows
+    }
+
+
+def import_legacy_cli_active(
+    migration_name: str, records: list[tuple[str, str, float]]
+) -> bool:
+    """Import legacy active-chat heartbeats exactly once."""
+    c = conn()
+    with _db_lock:
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            if _migration_exists(c, migration_name):
+                c.rollback()
+                return False
+            imported = 0
+            for user_id, session_id, heartbeat in records:
+                cur = c.execute(
+                    "INSERT OR IGNORE INTO cli_active_conversations"
+                    "(user_id,session_id,heartbeat) VALUES(?,?,?)",
+                    (str(user_id), str(session_id), float(heartbeat)),
+                )
+                imported += max(0, int(cur.rowcount))
+            c.execute(
+                "INSERT INTO state_migrations(name,migrated_at,details) VALUES(?,?,?)",
+                (
+                    str(migration_name), now(),
+                    json.dumps({"records": imported}, sort_keys=True),
+                ),
+            )
+            c.commit()
+            return True
+        except Exception:
+            c.rollback()
+            raise
+
+
+def cli_active_touch(user_id: str, session_id: str, heartbeat: float | None = None) -> None:
+    timestamp = _safe_timestamp(heartbeat, now()) if heartbeat is not None else now()
+    c = conn()
+    with _db_lock:
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute(
+                "INSERT INTO cli_active_conversations(user_id,session_id,heartbeat) "
+                "VALUES(?,?,?) ON CONFLICT(user_id,session_id) DO UPDATE SET "
+                "heartbeat=excluded.heartbeat",
+                (str(user_id), str(session_id), timestamp),
+            )
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+
+
+def cli_active_remove(user_id: str, session_id: str | None = None) -> bool:
+    c = conn()
+    with _db_lock:
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            if session_id is None:
+                cur = c.execute(
+                    "DELETE FROM cli_active_conversations WHERE user_id=?",
+                    (str(user_id),),
+                )
+            else:
+                cur = c.execute(
+                    "DELETE FROM cli_active_conversations WHERE user_id=? AND session_id=?",
+                    (str(user_id), str(session_id)),
+                )
+            removed = int(cur.rowcount) > 0
+            c.commit()
+            return removed
+        except Exception:
+            c.rollback()
+            raise
+
+
+def cli_active_is_claimed(
+    user_id: str, *, ttl_seconds: float = 90.0, at: float | None = None
+) -> bool:
+    ttl = max(1.0, min(float(ttl_seconds), 3_600.0))
+    cutoff = (now() if at is None else float(at)) - ttl
+    row = conn().execute(
+        "SELECT 1 FROM cli_active_conversations "
+        "WHERE user_id=? AND heartbeat>=? LIMIT 1",
+        (str(user_id), cutoff),
+    ).fetchone()
+    return row is not None
+
+
+def cli_active_cleanup(*, ttl_seconds: float = 300.0) -> int:
+    ttl = max(1.0, min(float(ttl_seconds), 86_400.0))
+    c = conn()
+    with _db_lock:
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            cur = c.execute(
+                "DELETE FROM cli_active_conversations WHERE heartbeat<?",
+                (now() - ttl,),
+            )
+            removed = max(0, int(cur.rowcount))
+            c.commit()
+            return removed
+        except Exception:
+            c.rollback()
+            raise
 
 
 def now() -> float:
@@ -282,6 +982,13 @@ _DEFAULT_GUILD = {
     "swear_level": "full",
     "allowed_channels": [],
     "smart_always": True,
+    "history_enabled": False,
+    "moderation_enabled": False,
+    "rules_enabled": False,
+    "voice_transcription_enabled": False,
+    "approval_channel": "",
+    "modlog_channel": "",
+    "retention_days": MAX_RETENTION_DAYS,
 }
 
 
@@ -381,15 +1088,18 @@ def relationship_set(
 
 
 def relationship_top(guild_id: str, limit: int = 10, worst: bool = False) -> List[dict]:
-    order = "ASC" if worst else "DESC"
-    rows = conn().execute(
-        f"SELECT * FROM relationships WHERE guild_id=? ORDER BY score {order} LIMIT ?",
-        (guild_id, limit),
-    ).fetchall()
+    query = (
+        "SELECT * FROM relationships WHERE guild_id=? ORDER BY score ASC LIMIT ?"
+        if worst
+        else "SELECT * FROM relationships WHERE guild_id=? ORDER BY score DESC LIMIT ?"
+    )
+    rows = conn().execute(query, (guild_id, limit)).fetchall()
     return [dict(r) for r in rows]
 
 
 def convo_add(user_id: str, guild_id: str, role: str, content: str) -> None:
+    if not history_storage_allowed(str(user_id), str(guild_id)):
+        return
     c = conn()
     c.execute(
         "INSERT INTO conversations(user_id,guild_id,role,content,created) VALUES(?,?,?,?,?)",
@@ -456,8 +1166,23 @@ def quote_list(guild_id: str, limit: int = 20) -> List[dict]:
     return [dict(r) for r in rows]
 
 
-def quote_delete(qid: int) -> bool:
-    cur = conn().execute("DELETE FROM quotes WHERE id=?", (qid,))
+def quote_delete(
+    qid: int,
+    scope_id: str,
+    requester_id: str,
+    *,
+    can_moderate: bool = False,
+) -> bool:
+    """Delete only a quote owned by this scope and actor (or its moderator)."""
+    if can_moderate:
+        cur = conn().execute(
+            "DELETE FROM quotes WHERE id=? AND guild_id=?", (qid, scope_id)
+        )
+    else:
+        cur = conn().execute(
+            "DELETE FROM quotes WHERE id=? AND guild_id=? AND author=?",
+            (qid, scope_id, requester_id),
+        )
     conn().commit()
     return cur.rowcount > 0
 
@@ -514,6 +1239,7 @@ def add_memory(content, author, guild_id, subject="server", importance=0.5) -> i
                     (text, new_imp, now(), author, row["id"]),
                 )
                 conn().commit()
+                _invalidate_memory_cache(subject=subject, scope_id=guild_id)
                 return row["id"]
     cur = conn().execute(
         "INSERT INTO memories(subject,content,author,guild_id,importance,created,updated) "
@@ -521,6 +1247,7 @@ def add_memory(content, author, guild_id, subject="server", importance=0.5) -> i
         (subject, content, author, guild_id, importance, now(), now()),
     )
     conn().commit()
+    _invalidate_memory_cache(subject=subject, scope_id=guild_id)
     _enforce_memory_cap(subject, guild_id)
     return cur.lastrowid
 
@@ -541,6 +1268,7 @@ def _enforce_memory_cap(subject: str, guild_id: str) -> None:
                 (new_imp, r["id"]),
             )
     conn().commit()
+    _invalidate_memory_cache(subject=subject, scope_id=guild_id)
 
 
 def update_memory(mem_id: int, content: str = None, importance: float = None) -> bool:
@@ -554,6 +1282,7 @@ def update_memory(mem_id: int, content: str = None, importance: float = None) ->
         (content.strip(), max(0.0, min(1.0, importance)), now(), mem_id),
     )
     conn().commit()
+    _invalidate_memory_cache(subject=str(row["subject"]), scope_id=str(row["guild_id"] or ""))
     return True
 
 
@@ -564,9 +1293,10 @@ def memories_about(subject: str, guild_id: Optional[str]) -> List[sqlite3.Row]:
     cached = _mem_cache_get(key)
     if cached is not None:
         return cached
+    if gid is None:
+        return []
     rows = conn().execute(
-        "SELECT * FROM memories WHERE subject=? AND "
-        "(guild_id=? OR guild_id IS NULL OR guild_id='' OR guild_id='dm') "
+        "SELECT * FROM memories WHERE subject=? AND guild_id=? "
         "ORDER BY importance DESC, created DESC",
         (subject, gid),
     ).fetchall()
@@ -576,16 +1306,13 @@ def memories_about(subject: str, guild_id: Optional[str]) -> List[sqlite3.Row]:
 
 def scope_memories(guild_id: Optional[str]) -> List[sqlite3.Row]:
     if guild_id is None:
-        return conn().execute("SELECT * FROM memories").fetchall()
+        return []
     gid = str(guild_id)
     key = ("scope", gid)
     cached = _mem_cache_get(key)
     if cached is not None:
         return cached
-    rows = conn().execute(
-        "SELECT * FROM memories WHERE guild_id=? OR guild_id IS NULL OR guild_id='' OR guild_id='dm'",
-        (gid,),
-    ).fetchall()
+    rows = conn().execute("SELECT * FROM memories WHERE guild_id=?", (gid,)).fetchall()
     _mem_cache_set(key, rows)
     return rows
 
@@ -597,8 +1324,11 @@ def get_memory(mem_id: int) -> Optional[sqlite3.Row]:
 
 
 def forget_memory(mem_id: int) -> bool:
+    row = get_memory(mem_id)
     cur = conn().execute("DELETE FROM memories WHERE id=?", (int(mem_id),))
     conn().commit()
+    if row is not None:
+        _invalidate_memory_cache(subject=str(row["subject"]), scope_id=str(row["guild_id"] or ""))
     return cur.rowcount > 0
 
 
@@ -620,8 +1350,7 @@ def forget_memories_about(
         cur = conn().execute("DELETE FROM memories WHERE subject=?", (subject,))
     else:
         cur = conn().execute(
-            "DELETE FROM memories WHERE subject=? AND "
-            "(guild_id=? OR guild_id IS NULL OR guild_id='' OR guild_id='dm')",
+            "DELETE FROM memories WHERE subject=? AND guild_id=?",
             (subject, gid),
         )
     n_mem = cur.rowcount
@@ -635,6 +1364,10 @@ def forget_memories_about(
         else:
             n_convo = convo_clear(subject, gid)
     conn().commit()
+    if all_guilds or gid is None:
+        _invalidate_memory_cache(subject=subject)
+    else:
+        _invalidate_memory_cache(subject=subject, scope_id=gid)
     return {"memories": n_mem, "convo": n_convo}
 
 
@@ -648,15 +1381,18 @@ def compact_memories(subject: str, guild_id: str, keep: int = 15) -> int:
     for i in drop_ids:
         conn().execute("DELETE FROM memories WHERE id=?", (i,))
     conn().commit()
+    _invalidate_memory_cache(subject=subject, scope_id=str(guild_id))
     return len(drop_ids)
 
 
-def add_lesson(content: str, source: str = "reflection") -> bool:
+def add_lesson(content: str, source: str = "reflection", scope_id: str | None = None) -> bool:
     global _lessons_cache
+    if not scope_id or not (is_guild_scope(scope_id) or is_dm_scope(scope_id)):
+        return False
     try:
         conn().execute(
-            "INSERT INTO lessons(content,source,created) VALUES(?,?,?)",
-            (content.strip(), source, now()),
+            "INSERT INTO lessons(content,source,created,scope_id,enabled) VALUES(?,?,?,?,1)",
+            (content.strip()[:500], source, now(), scope_id),
         )
         conn().commit()
         _lessons_cache = None
@@ -665,38 +1401,61 @@ def add_lesson(content: str, source: str = "reflection") -> bool:
         return False
 
 
-def all_lessons():
+def all_lessons(scope_id: str | None = None):
     global _lessons_cache, _lessons_ts
+    if not scope_id:
+        return []
     now_t = time.time()
-    if _lessons_cache is not None and now_t - _lessons_ts < _LESSONS_TTL:
-        return _lessons_cache
-    _lessons_cache = conn().execute("SELECT * FROM lessons ORDER BY created").fetchall()
+    cache_key = str(scope_id)
+    if isinstance(_lessons_cache, dict) and now_t - _lessons_ts < _LESSONS_TTL:
+        return _lessons_cache.get(cache_key, [])
+    rows = conn().execute(
+        "SELECT * FROM lessons WHERE scope_id=? AND enabled=1 ORDER BY created",
+        (scope_id,),
+    ).fetchall()
+    _lessons_cache = {cache_key: rows}
     _lessons_ts = now_t
-    return _lessons_cache
+    return rows
 
 
-def delete_lesson(lesson_id: int) -> bool:
+def delete_lesson(lesson_id: int, scope_id: str) -> bool:
     global _lessons_cache
-    cur = conn().execute("DELETE FROM lessons WHERE id=?", (lesson_id,))
+    cur = conn().execute(
+        "DELETE FROM lessons WHERE id=? AND scope_id=?", (lesson_id, scope_id)
+    )
     conn().commit()
     if cur.rowcount:
         _lessons_cache = None
     return cur.rowcount > 0
 
 
-def add_feedback(user_msg, bot_msg, verdict, author, note=None) -> int:
+def add_feedback(user_msg, bot_msg, verdict, author, note=None, scope_id: str | None = None) -> int:
+    if not scope_id:
+        return 0
     cur = conn().execute(
-        "INSERT INTO feedback(user_msg,bot_msg,verdict,note,author,created) "
-        "VALUES(?,?,?,?,?,?)",
-        (user_msg, bot_msg, verdict, note, author, now()),
+        "INSERT INTO feedback(user_msg,bot_msg,verdict,note,author,created,scope_id) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (user_msg, bot_msg, verdict, note, author, now(), scope_id),
     )
     conn().commit()
     return cur.lastrowid
 
 
-def unprocessed_feedback(limit: int):
+def unprocessed_feedback(limit: int, scope_id: str | None = None):
+    selected_scope = str(scope_id or "")
+    if not selected_scope:
+        first = conn().execute(
+            "SELECT scope_id FROM feedback WHERE processed=0 AND scope_id IS NOT NULL "
+            "ORDER BY created LIMIT 1"
+        ).fetchone()
+        if not first:
+            return []
+        selected_scope = str(first["scope_id"] or "")
+    if not (is_guild_scope(selected_scope) or is_dm_scope(selected_scope)):
+        return []
     return conn().execute(
-        "SELECT * FROM feedback WHERE processed=0 ORDER BY created LIMIT ?", (limit,)
+        "SELECT * FROM feedback WHERE processed=0 AND scope_id=? ORDER BY created LIMIT ?",
+        (selected_scope, limit),
     ).fetchall()
 
 
@@ -709,30 +1468,47 @@ def mark_feedback_processed(ids) -> None:
 
 def add_command(name, description, behavior, author, guild_id) -> None:
     conn().execute(
-        "INSERT INTO commands(name,description,behavior,author,guild_id,created) "
-        "VALUES(?,?,?,?,?,?) "
-        "ON CONFLICT(name) DO UPDATE SET "
-        "description=excluded.description, behavior=excluded.behavior",
-        (name.lower(), description, behavior, author, guild_id, now()),
+        "INSERT INTO commands(scope_id,name,description,behavior,author,created,enabled) "
+        "VALUES(?,?,?,?,?,?,1) "
+        "ON CONFLICT(scope_id,name) DO UPDATE SET "
+        "description=excluded.description, behavior=excluded.behavior, author=excluded.author, enabled=1",
+        (guild_id, name.lower(), description, behavior, author, now()),
     )
     conn().commit()
 
 
-def get_command(name):
-    return conn().execute("SELECT * FROM commands WHERE name=?", (name.lower(),)).fetchone()
+def get_command(name, scope_id: str):
+    return conn().execute(
+        "SELECT * FROM commands WHERE scope_id=? AND name=? AND enabled=1",
+        (scope_id, name.lower()),
+    ).fetchone()
 
 
-def all_commands():
-    return conn().execute("SELECT * FROM commands ORDER BY uses DESC").fetchall()
+def all_commands(scope_id: str):
+    return conn().execute(
+        "SELECT * FROM commands WHERE scope_id=? AND enabled=1 ORDER BY uses DESC",
+        (scope_id,),
+    ).fetchall()
 
 
-def bump_command(name) -> None:
-    conn().execute("UPDATE commands SET uses=uses+1 WHERE name=?", (name.lower(),))
+def bump_command(name, scope_id: str) -> None:
+    conn().execute(
+        "UPDATE commands SET uses=uses+1 WHERE scope_id=? AND name=?",
+        (scope_id, name.lower()),
+    )
     conn().commit()
 
 
-def delete_command(name) -> bool:
-    cur = conn().execute("DELETE FROM commands WHERE name=?", (name.lower(),))
+def delete_command(name, scope_id: str, requester_id: str, *, can_moderate: bool = False) -> bool:
+    if can_moderate:
+        cur = conn().execute(
+            "DELETE FROM commands WHERE scope_id=? AND name=?", (scope_id, name.lower())
+        )
+    else:
+        cur = conn().execute(
+            "DELETE FROM commands WHERE scope_id=? AND name=? AND author=?",
+            (scope_id, name.lower(), requester_id),
+        )
     conn().commit()
     return cur.rowcount > 0
 
@@ -747,7 +1523,10 @@ def log_interaction(kind, author, guild_id) -> None:
 
 def stats() -> dict:
     c = conn()
-    q = lambda sql, *a: c.execute(sql, a).fetchone()["n"]
+
+    def q(sql: str, *a):
+        return c.execute(sql, a).fetchone()["n"]
+
     return {
         "interactions": q("SELECT COUNT(*) n FROM interactions"),
         "memories": q("SELECT COUNT(*) n FROM memories"),
@@ -761,15 +1540,14 @@ def stats() -> dict:
 
 
 def export_guild(guild_id: str) -> dict:
-    """Dump brain data for one guild (and global lessons)."""
+    """Dump a versioned, exact-scope guild bundle."""
     return {
-        "version": 2,
-        "guild_id": guild_id,
+        "schema_version": 2,
+        "scope": guild_id,
         "exported_at": now(),
         "settings": guild_settings(guild_id),
-        "memories": [dict(r) for r in scope_memories(guild_id) if r["guild_id"] == guild_id],
-        "lessons": [dict(r) for r in all_lessons()],
-        "commands": [dict(r) for r in all_commands() if (r["guild_id"] or "") == guild_id],
+        "memories": [dict(r) for r in scope_memories(guild_id)],
+        "commands": [dict(r) for r in all_commands(guild_id)],
         "quotes": quote_list(guild_id, limit=500),
         "relationships": [
             dict(r) for r in conn().execute(
@@ -779,51 +1557,151 @@ def export_guild(guild_id: str) -> dict:
     }
 
 
-def import_guild(data: dict, guild_id: str) -> dict:
-    """Import export payload into this guild. Returns counts."""
-    counts = {"memories": 0, "lessons": 0, "commands": 0, "quotes": 0, "relationships": 0}
+_IMPORT_LIMITS = {
+    "memories": 500,
+    "commands": 100,
+    "quotes": 500,
+    "relationships": 1000,
+}
+
+
+def validate_import_bundle(data: dict, scope_id: str) -> dict:
+    """Validate and normalize ImportBundleV2 before any database mutation."""
     if not isinstance(data, dict):
-        return counts
-    if isinstance(data.get("settings"), dict):
-        guild_settings_set(guild_id, **{k: v for k, v in data["settings"].items()
-                                        if k in _DEFAULT_GUILD})
-    for m in data.get("memories") or []:
-        if not isinstance(m, dict) or not m.get("content"):
-            continue
-        add_memory(
-            m["content"], m.get("author") or "import", guild_id,
-            subject=m.get("subject") or "server",
-            importance=float(m.get("importance", 0.5)),
-        )
-        counts["memories"] += 1
-    for l in data.get("lessons") or []:
-        content = l.get("content") if isinstance(l, dict) else l
-        if content and add_lesson(str(content), source="import"):
-            counts["lessons"] += 1
-    for c in data.get("commands") or []:
-        if not isinstance(c, dict) or not c.get("name"):
-            continue
-        add_command(
-            c["name"], c.get("description") or c["name"],
-            c.get("behavior") or "Respond helpfully.",
-            c.get("author") or "import", guild_id,
-        )
-        counts["commands"] += 1
-    for q in data.get("quotes") or []:
-        if not isinstance(q, dict) or not q.get("text"):
-            continue
-        quote_add(guild_id, q["text"], about=q.get("about"), author=q.get("author"))
-        counts["quotes"] += 1
-    for r in data.get("relationships") or []:
-        if not isinstance(r, dict) or not r.get("user_id"):
-            continue
-        relationship_set(
-            str(r["user_id"]), guild_id,
-            score=float(r.get("score", 0)),
-            nickname=r.get("nickname"),
-            grudge=r.get("grudge"),
-        )
-        counts["relationships"] += 1
+        raise ValueError("import must be a JSON object")
+    allowed_sections = {
+        "schema_version",
+        "scope",
+        "exported_at",
+        "settings",
+        *_IMPORT_LIMITS,
+    }
+    unknown_sections = sorted(set(data) - allowed_sections)
+    if unknown_sections:
+        raise ValueError(f"unsupported import section(s): {', '.join(unknown_sections)}")
+    if data.get("schema_version") != 2:
+        raise ValueError("unsupported import schema; expected schema_version 2")
+    if str(data.get("scope") or "") != str(scope_id):
+        raise ValueError("import scope does not match this server")
+
+    clean: dict = {"schema_version": 2, "scope": scope_id}
+    settings = data.get("settings") or {}
+    if not isinstance(settings, dict):
+        raise ValueError("settings must be an object")
+    clean["settings"] = {k: v for k, v in settings.items() if k in _DEFAULT_GUILD}
+
+    for section, maximum in _IMPORT_LIMITS.items():
+        rows = data.get(section) or []
+        if not isinstance(rows, list):
+            raise ValueError(f"{section} must be an array")
+        if len(rows) > maximum:
+            raise ValueError(f"{section} exceeds the {maximum}-row limit")
+        if not all(isinstance(row, dict) for row in rows):
+            raise ValueError(f"every {section} entry must be an object")
+        clean[section] = rows
+
+    for row in clean["memories"]:
+        content = str(row.get("content") or "").strip()
+        if not content or len(content) > 2_000:
+            raise ValueError("memory content must be 1-2000 characters")
+    for row in clean["commands"]:
+        name = str(row.get("name") or "").lower()
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{1,31}", name):
+            raise ValueError(f"invalid command name: {name!r}")
+        description = str(row.get("description") or "")
+        if len(description) > 200:
+            raise ValueError(f"command {name!r} description is too long")
+        if len(str(row.get("behavior") or "")) > 4_000:
+            raise ValueError(f"command {name!r} behavior is too long")
+    for row in clean["quotes"]:
+        if not str(row.get("text") or "").strip() or len(str(row.get("text"))) > 500:
+            raise ValueError("quote text must be 1-500 characters")
+    for row in clean["relationships"]:
+        user_id = str(row.get("user_id") or "").strip()
+        if not user_id or len(user_id) > 32:
+            raise ValueError("relationship user_id must be 1-32 characters")
+        try:
+            score = float(row.get("score", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("relationship score must be a number") from exc
+        if not math.isfinite(score) or not -1.0 <= score <= 1.0:
+            raise ValueError("relationship score must be between -1 and 1")
+        if len(str(row.get("nickname") or "")) > 40:
+            raise ValueError("relationship nickname is too long")
+        if len(str(row.get("grudge") or "")) > 200:
+            raise ValueError("relationship grudge is too long")
+    return clean
+
+
+def import_guild(data: dict, guild_id: str) -> dict:
+    """Validate and atomically import a versioned exact-scope bundle."""
+    counts = {"memories": 0, "lessons": 0, "commands": 0, "quotes": 0, "relationships": 0}
+    bundle = validate_import_bundle(data, guild_id)
+    c = conn()
+    with _db_lock:
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            if bundle["settings"]:
+                settings = {**guild_settings(guild_id), **bundle["settings"]}
+                c.execute(
+                    "INSERT INTO guild_settings(guild_id,data) VALUES(?,?) "
+                    "ON CONFLICT(guild_id) DO UPDATE SET data=excluded.data",
+                    (guild_id, json.dumps(settings)),
+                )
+            for row in bundle["memories"]:
+                c.execute(
+                    "INSERT INTO memories(subject,content,author,guild_id,importance,created,updated) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (
+                        normalize_subject(row.get("subject"), row.get("author")),
+                        str(row["content"]).strip(), str(row.get("author") or "import"),
+                        guild_id, max(0.0, min(1.0, float(row.get("importance", 0.5)))),
+                        now(), now(),
+                    ),
+                )
+                counts["memories"] += 1
+            for row in bundle["commands"]:
+                c.execute(
+                    "INSERT INTO commands(scope_id,name,description,behavior,author,created,enabled) "
+                    "VALUES(?,?,?,?,?,?,1) ON CONFLICT(scope_id,name) DO UPDATE SET "
+                    "description=excluded.description,behavior=excluded.behavior,"
+                    "author=excluded.author,enabled=1",
+                    (
+                        guild_id, str(row["name"]).lower(),
+                        str(row.get("description") or row["name"])[:200],
+                        str(row.get("behavior") or "Respond helpfully.")[:4000],
+                        str(row.get("author") or "import"), now(),
+                    ),
+                )
+                counts["commands"] += 1
+            for row in bundle["quotes"]:
+                c.execute(
+                    "INSERT INTO quotes(guild_id,text,about,author,created) VALUES(?,?,?,?,?)",
+                    (guild_id, str(row["text"]).strip(), row.get("about"), row.get("author"), now()),
+                )
+                counts["quotes"] += 1
+            for row in bundle["relationships"]:
+                uid = str(row.get("user_id") or "")
+                if not uid:
+                    continue
+                score = max(-1.0, min(1.0, float(row.get("score", 0))))
+                c.execute(
+                    "INSERT INTO relationships(user_id,guild_id,score,nickname,grudge,bond_label,updated) "
+                    "VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,guild_id) DO UPDATE SET "
+                    "score=excluded.score,nickname=excluded.nickname,grudge=excluded.grudge,"
+                    "bond_label=excluded.bond_label,updated=excluded.updated",
+                    (
+                        uid, guild_id, score, str(row.get("nickname") or "")[:40] or None,
+                        str(row.get("grudge") or "")[:200] or None, _bond_label(score), now(),
+                    ),
+                )
+                counts["relationships"] += 1
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+    _gs_cache.pop(guild_id, None)
+    _invalidate_memory_cache(scope_id=guild_id)
     return counts
 
 
@@ -843,6 +1721,266 @@ def user_flag_int(user_id: str, key: str, default: int = 0) -> int:
         return int(float(raw))
     except (TypeError, ValueError):
         return default
+
+
+def privacy_opted_in(user_id: str, scope_id: str) -> bool:
+    row = conn().execute(
+        "SELECT opted_in FROM privacy_consents WHERE user_id=? AND scope_id=?",
+        (str(user_id), str(scope_id)),
+    ).fetchone()
+    return bool(row and row["opted_in"])
+
+
+def privacy_set_opt_in(user_id: str, scope_id: str, opted_in: bool) -> None:
+    if not (is_guild_scope(scope_id) or is_dm_scope(scope_id)):
+        raise ValueError("privacy consent requires a canonical scope")
+    conn().execute(
+        "INSERT INTO privacy_consents(user_id,scope_id,opted_in,updated) VALUES(?,?,?,?) "
+        "ON CONFLICT(user_id,scope_id) DO UPDATE SET "
+        "opted_in=excluded.opted_in,updated=excluded.updated",
+        (str(user_id), str(scope_id), 1 if opted_in else 0, now()),
+    )
+    conn().commit()
+
+
+def privacy_remove_scope_history(user_id: str, scope_id: str) -> int:
+    cur = conn().execute(
+        "DELETE FROM server_messages WHERE user_id=? AND guild_id=?",
+        (str(user_id), str(scope_id)),
+    )
+    conn().commit()
+    return max(0, int(cur.rowcount))
+
+
+def history_storage_allowed(user_id: str, scope_id: str) -> bool:
+    if not privacy_opted_in(user_id, scope_id):
+        return False
+    if is_dm_scope(scope_id):
+        return True
+    if not is_guild_scope(scope_id):
+        return False
+    return bool(guild_settings(scope_id).get("history_enabled", False))
+
+
+def privacy_export(user_id: str) -> dict:
+    """Return only data owned by, authored by, or explicitly about a user."""
+    uid = str(user_id)
+    c = conn()
+    return {
+        "schema_version": 1,
+        "user_id": uid,
+        "exported_at": now(),
+        "consents": [
+            dict(r) for r in c.execute(
+                "SELECT scope_id,opted_in,updated FROM privacy_consents WHERE user_id=?",
+                (uid,),
+            ).fetchall()
+        ],
+        "memories": [
+            dict(r) for r in c.execute(
+                "SELECT * FROM memories WHERE subject=? OR author=?", (uid, uid)
+            ).fetchall()
+        ],
+        "conversations": [
+            dict(r) for r in c.execute(
+                "SELECT * FROM conversations WHERE user_id=?", (uid,)
+            ).fetchall()
+        ],
+        "relationships": [
+            dict(r) for r in c.execute(
+                "SELECT * FROM relationships WHERE user_id=?", (uid,)
+            ).fetchall()
+        ],
+        "quotes": [
+            dict(r) for r in c.execute(
+                "SELECT * FROM quotes WHERE author=? OR about=?", (uid, uid)
+            ).fetchall()
+        ],
+        "feedback": [
+            dict(r) for r in c.execute(
+                "SELECT * FROM feedback WHERE author=?", (uid,)
+            ).fetchall()
+        ],
+        "interactions": [
+            dict(r) for r in c.execute(
+                "SELECT * FROM interactions WHERE author=?", (uid,)
+            ).fetchall()
+        ],
+        "messages": [
+            dict(r) for r in c.execute(
+                "SELECT message_id,guild_id,channel_id,content,created FROM server_messages "
+                "WHERE user_id=? ORDER BY created", (uid,)
+            ).fetchall()
+        ],
+        "dm_contacts": [
+            dict(r) for r in c.execute(
+                "SELECT user_id,name,last_message_at FROM dm_contacts WHERE user_id=?",
+                (uid,),
+            ).fetchall()
+        ],
+        "dynamic_blocks": [
+            {"user_id": uid, **metadata}
+            for metadata in [dynamic_block_get(uid)]
+            if metadata is not None
+        ],
+    }
+
+
+def privacy_delete_user(user_id: str) -> dict[str, int]:
+    """Transactionally erase all user-owned content and revoke consent."""
+    uid = str(user_id)
+    delete_queries = {
+        "memories": ("DELETE FROM memories WHERE subject=? OR author=?", (uid, uid)),
+        "conversations": ("DELETE FROM conversations WHERE user_id=?", (uid,)),
+        "relationships": ("DELETE FROM relationships WHERE user_id=?", (uid,)),
+        "quotes": ("DELETE FROM quotes WHERE author=? OR about=?", (uid, uid)),
+        "feedback": ("DELETE FROM feedback WHERE author=?", (uid,)),
+        "interactions": ("DELETE FROM interactions WHERE author=?", (uid,)),
+        "server_messages": ("DELETE FROM server_messages WHERE user_id=?", (uid,)),
+        "privacy_consents": ("DELETE FROM privacy_consents WHERE user_id=?", (uid,)),
+        "commands": ("DELETE FROM commands WHERE author=?", (uid,)),
+        "economy_accounts": ("DELETE FROM economy_accounts WHERE user_id=?", (uid,)),
+        "work_cooldowns": ("DELETE FROM work_cooldowns WHERE user_id=?", (uid,)),
+        "dm_contacts": ("DELETE FROM dm_contacts WHERE user_id=?", (uid,)),
+        "cli_active_conversations": ("DELETE FROM cli_active_conversations WHERE user_id=?", (uid,)),
+        "dynamic_blocks": ("DELETE FROM dynamic_blocks WHERE user_id=?", (uid,)),
+    }
+    counts: dict[str, int] = {}
+    c = conn()
+    with _db_lock:
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            for table, (sql, args) in delete_queries.items():
+                cur = c.execute(sql, args)
+                counts[table] = max(0, int(cur.rowcount))
+            cur = c.execute("DELETE FROM kv WHERE key LIKE ?", (f"uf:{uid}:%",))
+            counts["user_flags"] = max(0, int(cur.rowcount))
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+    _invalidate_memory_cache()
+    return counts
+
+
+def cleanup_expired_content(retention_days: int = MAX_RETENTION_DAYS) -> dict[str, int]:
+    days = max(1, min(MAX_RETENTION_DAYS, int(retention_days)))
+    cutoff = now() - days * 86_400
+    c = conn()
+    counts = {}
+    with _db_lock:
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            cur = c.execute("DELETE FROM server_messages WHERE created<?", (cutoff,))
+            counts["server_messages"] = max(0, int(cur.rowcount))
+            cur = c.execute("DELETE FROM conversations WHERE created<?", (cutoff,))
+            counts["conversations"] = max(0, int(cur.rowcount))
+            cur = c.execute("DELETE FROM feedback WHERE created<?", (cutoff,))
+            counts["feedback"] = max(0, int(cur.rowcount))
+            cur = c.execute(
+                "DELETE FROM cli_active_conversations WHERE heartbeat<?",
+                (now() - 300.0,),
+            )
+            counts["cli_active_conversations"] = max(0, int(cur.rowcount))
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+    return counts
+
+
+def record_action_audit(
+    *, nonce: str, actor_id: str, scope_id: str, action: str,
+    target_id: str | None, parameters: dict, source: str,
+    correlation_id: str, status: str, result: str | None = None,
+) -> None:
+    conn().execute(
+        "INSERT INTO action_audit(nonce,actor_id,scope_id,action,target_id,parameters,"
+        "source,correlation_id,status,result,created,completed) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(nonce) DO UPDATE SET status=excluded.status,result=excluded.result,"
+        "completed=excluded.completed",
+        (
+            nonce, actor_id, scope_id, action[:80], target_id,
+            json.dumps(parameters, sort_keys=True, default=str)[:4000], source[:40],
+            correlation_id[:80], status[:40], (result or "")[:500] or None,
+            now(), now() if status not in {"pending"} else None,
+        ),
+    )
+    conn().commit()
+
+
+def economy_balance(user_id: str) -> int:
+    row = conn().execute(
+        "SELECT balance FROM economy_accounts WHERE user_id=?", (str(user_id),)
+    ).fetchone()
+    return int(row["balance"]) if row else 0
+
+
+def economy_adjust(user_id: str, delta: int) -> int:
+    uid = str(user_id)
+    c = conn()
+    with _db_lock:
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            current = economy_balance(uid)
+            balance = max(0, current + int(delta))
+            c.execute(
+                "INSERT INTO economy_accounts(user_id,balance,updated) VALUES(?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET balance=excluded.balance,updated=excluded.updated",
+                (uid, balance, now()),
+            )
+            c.commit()
+            return balance
+        except Exception:
+            c.rollback()
+            raise
+
+
+def economy_leaderboard(limit: int = 10) -> list[tuple[str, dict]]:
+    rows = conn().execute(
+        "SELECT user_id,balance,deposit FROM economy_accounts ORDER BY balance DESC LIMIT ?",
+        (max(1, min(100, int(limit))),),
+    ).fetchall()
+    return [
+        (str(r["user_id"]), {"balance": int(r["balance"]), "deposit": int(r["deposit"])})
+        for r in rows
+    ]
+
+
+def economy_claim_work(user_id: str, reward: int, cooldown_seconds: int = 60) -> tuple[int, int]:
+    """Atomically enforce cooldown and credit work; returns (seconds_left,balance)."""
+    uid = str(user_id)
+    c = conn()
+    with _db_lock:
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute(
+                "SELECT last_work FROM work_cooldowns WHERE user_id=?", (uid,)
+            ).fetchone()
+            current_time = now()
+            if row:
+                remaining = int(max(0.0, cooldown_seconds - (current_time - float(row["last_work"]))))
+                if remaining > 0:
+                    balance = economy_balance(uid)
+                    c.rollback()
+                    return remaining, balance
+            current = economy_balance(uid)
+            balance = max(0, current + int(reward))
+            c.execute(
+                "INSERT INTO economy_accounts(user_id,balance,updated) VALUES(?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET balance=excluded.balance,updated=excluded.updated",
+                (uid, balance, current_time),
+            )
+            c.execute(
+                "INSERT INTO work_cooldowns(user_id,last_work) VALUES(?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET last_work=excluded.last_work",
+                (uid, current_time),
+            )
+            c.commit()
+            return 0, balance
+        except Exception:
+            c.rollback()
+            raise
 
 
 _BAD_PATTERNS = [
@@ -873,7 +2011,12 @@ def record_server_message(
     display_name: str,
     content: str,
 ) -> None:
-    if not content or not user_id:
+    if (
+        not content
+        or not user_id
+        or not (is_guild_scope(guild_id) or is_dm_scope(guild_id))
+        or not history_storage_allowed(str(user_id), str(guild_id))
+    ):
         return
     has_bad, matches = detect_bad_words(content)
     bad_str = json.dumps(matches) if has_bad else ""
@@ -938,12 +2081,11 @@ def get_user_intelligence(user_id: str, guild_id: Optional[str] = None) -> dict:
     favorite words, flagged messages, recent + random old message samples."""
     c = conn()
     uid = str(user_id)
-    gid = str(guild_id) if guild_id and guild_id != "dm" else None
-    w = "user_id=?"
-    args = [uid]
-    if gid:
-        w += " AND guild_id=?"
-        args.append(gid)
+    gid = str(guild_id or "")
+    if not gid:
+        return _empty_user_intelligence(uid)
+    w = "user_id=? AND guild_id=?"
+    args = [uid, gid]
 
     def q(sql: str, extra: str = "", limit: int = None):
         lim = f" LIMIT {int(limit)}" if limit else ""
@@ -961,16 +2103,16 @@ def get_user_intelligence(user_id: str, guild_id: Optional[str] = None) -> dict:
         "FROM server_messages WHERE {w}"
     ).fetchone()
     bad_msgs = q(
-        "SELECT channel_name, content, bad_words_found, created FROM server_messages "
+        "SELECT channel_id, channel_name, content, bad_words_found, created FROM server_messages "
         "WHERE {w} AND has_bad_words=1 ORDER BY created DESC", limit=15
     ).fetchall()
     recent_msgs = q(
-        "SELECT channel_name, content, created FROM server_messages "
+        "SELECT channel_id, channel_name, content, created FROM server_messages "
         "WHERE {w} ORDER BY created DESC", limit=60
     ).fetchall()
     sample_msgs = q(
-        "SELECT channel_name, content, created FROM ("
-        "SELECT channel_name, content, created FROM server_messages "
+        "SELECT channel_id, channel_name, content, created FROM ("
+        "SELECT channel_id, channel_name, content, created FROM server_messages "
         "WHERE {w} ORDER BY created DESC LIMIT 5000"
         ") ORDER BY RANDOM()", limit=12
     ).fetchall()
@@ -986,8 +2128,9 @@ def get_user_intelligence(user_id: str, guild_id: Optional[str] = None) -> dict:
         "SELECT content FROM server_messages WHERE {w} ORDER BY created DESC", limit=2000
     ).fetchall()
     user_info = c.execute(
-        "SELECT username, display_name FROM server_messages WHERE user_id=? ORDER BY created DESC LIMIT 1",
-        (uid,),
+        "SELECT username, display_name FROM server_messages WHERE user_id=? AND guild_id=? "
+        "ORDER BY created DESC LIMIT 1",
+        (uid, gid),
     ).fetchone()
 
     return {
@@ -1010,22 +2153,38 @@ def get_user_intelligence(user_id: str, guild_id: Optional[str] = None) -> dict:
     }
 
 
+def _empty_user_intelligence(user_id: str) -> dict:
+    return {
+        "user_id": user_id,
+        "username": user_id,
+        "display_name": user_id,
+        "total_messages": 0,
+        "bad_message_count": 0,
+        "first_seen": None,
+        "last_seen": None,
+        "active_days": 0,
+        "avg_len": 0,
+        "max_len": 0,
+        "bad_messages": [],
+        "recent_messages": [],
+        "sample_messages": [],
+        "monthly": [],
+        "channels": [],
+        "top_words": [],
+    }
+
+
 def get_user_bad_messages(user_id: str, guild_id: Optional[str] = None, limit: int = 20) -> List[dict]:
     c = conn()
     uid = str(user_id)
-    gid = str(guild_id) if guild_id and guild_id != "dm" else None
-    if gid:
-        rows = c.execute(
-            "SELECT channel_name, content, bad_words_found, created FROM server_messages "
-            "WHERE user_id=? AND guild_id=? AND has_bad_words=1 ORDER BY created DESC LIMIT ?",
-            (uid, gid, limit)
-        ).fetchall()
-    else:
-        rows = c.execute(
-            "SELECT channel_name, content, bad_words_found, created FROM server_messages "
-            "WHERE user_id=? AND has_bad_words=1 ORDER BY created DESC LIMIT ?",
-            (uid, limit)
-        ).fetchall()
+    gid = str(guild_id or "")
+    if not gid:
+        return []
+    rows = c.execute(
+        "SELECT channel_id, channel_name, content, bad_words_found, created FROM server_messages "
+        "WHERE user_id=? AND guild_id=? AND has_bad_words=1 ORDER BY created DESC LIMIT ?",
+        (uid, gid, limit)
+    ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -1082,26 +2241,23 @@ def find_user_by_name(query: str, guild_id: Optional[str] = None) -> Optional[di
     c = conn()
     q = query.strip().lstrip("@")
     m = _SNOWFLAKE.search(q)
+    gid = str(guild_id or "")
+    if not gid:
+        return None
     if m:
         uid = m.group(1)
-        row = c.execute("SELECT user_id, username, display_name FROM server_messages WHERE user_id=? LIMIT 1", (uid,)).fetchone()
+        row = c.execute(
+            "SELECT user_id, username, display_name FROM server_messages "
+            "WHERE user_id=? AND guild_id=? LIMIT 1", (uid, gid)
+        ).fetchone()
         if row:
             return dict(row)
         return {"user_id": uid, "username": uid, "display_name": uid}
 
-    gid = str(guild_id) if guild_id and guild_id != "dm" else None
-    if gid:
-        row = c.execute(
-            "SELECT user_id, username, display_name FROM server_messages "
-            "WHERE guild_id=? AND (username LIKE ? OR display_name LIKE ?) ORDER BY created DESC LIMIT 1",
-            (gid, f"%{q}%", f"%{q}%")
-        ).fetchone()
-        if row:
-            return dict(row)
-
     row = c.execute(
         "SELECT user_id, username, display_name FROM server_messages "
-        "WHERE username LIKE ? OR display_name LIKE ? ORDER BY created DESC LIMIT 1",
-        (f"%{q}%", f"%{q}%")
+        "WHERE guild_id=? AND (username LIKE ? OR display_name LIKE ?) "
+        "ORDER BY created DESC LIMIT 1",
+        (gid, f"%{q}%", f"%{q}%")
     ).fetchone()
     return dict(row) if row else None
