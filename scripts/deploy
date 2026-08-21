@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -12,15 +13,20 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
+WEBSITE_ROOT = ROOT.parents[1] / "website"
 CONFIG_DIR = Path.home() / ".config" / "opsef-deploy"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 STATE_FILE = CONFIG_DIR / "state.json"
+WEBSITE_STATE_FILE = CONFIG_DIR / "websites-state.json"
 PANEL_URL = "https://portal.daki.cc"
 MAX_API_RESPONSE_BYTES = 32 * 1024 * 1024
 MAX_DEPLOY_FILE_BYTES = 2 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 400 * 1024 * 1024
+WEBSITE_BUNDLE_NAME = "sites-bundle.zip"
 _SERVER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _SECRET_RE = re.compile(
@@ -30,6 +36,10 @@ _SECRET_RE = re.compile(
 )
 _KNOWN_SERVER_STATES = frozenset({"offline", "running", "starting", "stopping"})
 _DEPLOY_ROOT_FILES = frozenset({"requirements.txt", "requirements.lock"})
+_WEBSITE_IGNORE_NAMES = frozenset(
+    {".DS_Store", ".git", ".gitignore", "__pycache__", "node_modules", "CLAUDE.md"}
+)
+_DAKI_HOST_RE = re.compile(r"(^|\.)daki\.cc$", re.IGNORECASE)
 
 
 class DeployError(RuntimeError):
@@ -170,6 +180,74 @@ class DakiClient:
         except ApiError as error:
             if error.status != 404:
                 raise
+
+    def delete_root_entry(self, name):
+        if name not in {"sites", WEBSITE_BUNDLE_NAME}:
+            raise DeployError("Refusing to delete an unexpected remote path")
+        try:
+            self.request(
+                "POST",
+                self.server_path("/files/delete"),
+                {"root": "/", "files": [name]},
+            )
+        except ApiError as error:
+            if error.status != 404:
+                raise
+
+    def decompress_archive(self, filename, root="/"):
+        if filename != WEBSITE_BUNDLE_NAME:
+            raise DeployError("Refusing to extract an unexpected archive")
+        self.request(
+            "POST",
+            self.server_path("/files/decompress"),
+            {"root": root, "file": filename},
+            timeout=300,
+        )
+
+    def upload_archive(self, local_path, remote_name, directory="/"):
+        if remote_name != WEBSITE_BUNDLE_NAME:
+            raise DeployError("Refusing to upload an unexpected archive name")
+        if local_path.stat().st_size > MAX_ARCHIVE_BYTES:
+            raise DeployError("Refusing oversized website archive")
+        payload = self.request("GET", self.server_path("/files/upload"))
+        attributes = payload.get("attributes") if isinstance(payload, dict) else None
+        url = attributes.get("url") if isinstance(attributes, dict) else None
+        if not isinstance(url, str) or not url.startswith("https://"):
+            raise DeployError("Daki returned an invalid upload URL")
+        parsed = urllib.parse.urlparse(url)
+        if (
+            parsed.scheme != "https"
+            or parsed.username
+            or parsed.password
+            or not parsed.hostname
+            or not _DAKI_HOST_RE.search(parsed.hostname)
+        ):
+            raise DeployError("Daki returned an upload URL for an unexpected host")
+        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        query = [(key, value) for key, value in query if key != "directory"]
+        query.append(("directory", directory))
+        upload_url = urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query)))
+        curl = shutil.which("curl")
+        if not curl:
+            raise DeployError("curl is required to upload website archives")
+        result = subprocess.run(  # noqa: S603 - curl to a validated Daki HTTPS URL
+            [
+                curl,
+                "-fsS",
+                "--max-time",
+                "300",
+                "-X",
+                "POST",
+                "-F",
+                f"files=@{local_path};filename={remote_name}",
+                upload_url,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise DeployError("Website archive upload to Daki failed")
 
     def state(self):
         payload = self.request("GET", self.server_path("/resources"))
@@ -583,7 +661,157 @@ def wait_until_running(client, timeout=180):
     raise DeployError(f"Daki server did not remain running within {timeout} seconds")
 
 
+def _ignore_website_junk(_directory, names):
+    return [name for name in names if name in _WEBSITE_IGNORE_NAMES or name.endswith(".pyc")]
+
+
+def _copy_tree(source, destination):
+    if source.is_symlink() or not source.is_dir():
+        raise DeployError(f"Missing website source directory {source}")
+    shutil.copytree(
+        source,
+        destination,
+        dirs_exist_ok=True,
+        ignore=_ignore_website_junk,
+        ignore_dangling_symlinks=True,
+        symlinks=False,
+    )
+
+
+def assemble_sites(destination):
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True)
+    kozzyx = destination / "kozzyx"
+    pages = WEBSITE_ROOT / "kozzyx.org" / "pages"
+    _copy_tree(pages, kozzyx)
+    for folder in ("assets", "css", "js"):
+        source = WEBSITE_ROOT / "kozzyx.org" / folder
+        if source.is_dir():
+            _copy_tree(source, kozzyx / folder)
+    robots = WEBSITE_ROOT / "kozzyx.org" / "robots.txt"
+    if robots.is_file() and not robots.is_symlink():
+        shutil.copy2(robots, kozzyx / "robots.txt")
+    _copy_tree(WEBSITE_ROOT / "kirmy.org", destination / "kirmy")
+    wearegays = destination / "wearegays"
+    _copy_tree(WEBSITE_ROOT / "wearegays.net", wearegays)
+    multi = wearegays / "multi.html"
+    if multi.is_file() and not multi.is_symlink():
+        shutil.copy2(multi, wearegays / "index.html")
+    status_source = WEBSITE_ROOT / "wearedevsstatus"
+    if status_source.is_dir():
+        status_dir = wearegays / "status"
+        status_dir.mkdir(exist_ok=True)
+        for name in ("index.html", "jjsploit.html"):
+            source = status_source / name
+            if source.is_file() and not source.is_symlink():
+                shutil.copy2(source, status_dir / name)
+    social = WEBSITE_ROOT / "social"
+    if social.is_dir():
+        for site in ("kozzyx", "kirmy", "wearegays"):
+            _copy_tree(social, destination / site / "social")
+    required = [
+        destination / "kozzyx" / "index.html",
+        destination / "kirmy" / "index.html",
+        destination / "wearegays" / "index.html",
+    ]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise DeployError("Website assemble is missing index files")
+
+
+def build_sites_archive(source, archive):
+    if archive.exists():
+        archive.unlink()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        for path in sorted(source.rglob("*")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            relative = path.relative_to(source).as_posix()
+            bundle.write(path, f"sites/{relative}")
+    if archive.stat().st_size > MAX_ARCHIVE_BYTES:
+        archive.unlink(missing_ok=True)
+        raise DeployError("Website archive is larger than the deploy limit")
+
+
+def website_digest(archive):
+    digest = hashlib.sha256()
+    with archive.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def deploy_websites(args):
+    if not WEBSITE_ROOT.is_dir():
+        raise DeployError(f"Website source is missing at {WEBSITE_ROOT}")
+    with tempfile.TemporaryDirectory(prefix="opsef-websites-") as directory:
+        assembled = Path(directory) / "sites"
+        archive = Path(directory) / WEBSITE_BUNDLE_NAME
+        print("Assembling static sites...")
+        assemble_sites(assembled)
+        build_sites_archive(assembled, archive)
+        digest = website_digest(archive)
+        print(
+            f"Website bundle: {archive.stat().st_size} bytes, "
+            f"{sum(1 for path in assembled.rglob('*') if path.is_file())} files"
+        )
+        state = load_json(WEBSITE_STATE_FILE, {})
+        if not isinstance(state, dict):
+            raise DeployError("Website deployment state must be a JSON object")
+        previous = state.get("digest") if not args.full else None
+        if previous == digest and not args.restart and not args.setup:
+            print("No website changes found.")
+            if args.dry_run:
+                return
+            return
+        print("Files to upload:")
+        print(f"  {WEBSITE_BUNDLE_NAME} (extracted to /sites)")
+        if args.dry_run:
+            return
+        config = load_config(args.setup, args.allow_insecure_localhost)
+        confirm_deployment(
+            config,
+            [WEBSITE_BUNDLE_NAME],
+            ["sites"] if previous else [],
+            restart=not args.no_restart,
+            assume_yes=args.yes,
+        )
+        client = DakiClient(
+            config["panel_url"], config["api_key"], config["server_id"]
+        )
+        print("Uploading website archive to Daki...")
+        client.delete_root_entry(WEBSITE_BUNDLE_NAME)
+        client.upload_archive(archive, WEBSITE_BUNDLE_NAME, directory="/")
+        print("Replacing remote /sites ...")
+        client.delete_root_entry("sites")
+        client.decompress_archive(WEBSITE_BUNDLE_NAME)
+        client.delete_root_entry(WEBSITE_BUNDLE_NAME)
+        save_json(
+            WEBSITE_STATE_FILE,
+            {
+                "server_id": config["server_id"],
+                "digest": digest,
+                "deployed_at": int(time.time()),
+            },
+        )
+        print("Website files uploaded and extracted.")
+        if args.no_restart:
+            print("Upload complete. Daki was not restarted.")
+            return
+        print(f"Restarting {config.get('server_name', config['server_id'])}...")
+        client.restart()
+        wait_until_running(client)
+        print("Websites deployed to Daki successfully.")
+
+
 def deploy(args):
+    if getattr(args, "project", "opsef").lower() == "websites":
+        deploy_websites(args)
+        return
     current = snapshot()
     config = None
     state = load_json(STATE_FILE, {})
@@ -690,7 +918,7 @@ def parse_args():
         help="confirm remote writes, deletions, and restart (for trusted CI only)",
     )
     args = parser.parse_args()
-    if args.project.lower() != "opsef":
+    if args.project.lower() not in {"opsef", "websites"}:
         parser.error(f"unknown project: {args.project}")
     if args.no_restart and args.restart:
         parser.error("--no-restart and --restart cannot be combined")

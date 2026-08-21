@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import os
 import socket
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -9,6 +13,7 @@ from sefbot.web import (
     ReadinessState,
     WebConfigurationError,
     WebService,
+    _environment_port,
     create_app,
 )
 
@@ -50,8 +55,24 @@ class WebApplicationTests(unittest.IsolatedAsyncioTestCase):
                 body = await response.text()
                 self.assertIn("OpSef", body)
                 if path != "/sefbot":
-                    self.assertIn("Version 2.0", body)
+                    self.assertIn("Version 3.0", body)
                     self.assertIn("effective 19 August 2026", body)
+
+    async def test_legal_pages_match_the_running_privacy_model(self) -> None:
+        terms = await (await self.client.get("/sefbot/terms")).text()
+        privacy = await (await self.client.get("/sefbot/privacy")).text()
+        self.assertIn("/tos accept", terms)
+        self.assertIn("consent to store raw message", terms)
+        self.assertIn("SEFBOT_OWNER_ID", terms)
+        self.assertIn("TOS_STRIKE_LIMIT = 3", terms)
+        self.assertIn("Daki Hosting", terms)
+        self.assertIn("privacy_consents", privacy)
+        self.assertIn("action_audit", privacy)
+        self.assertIn("does not erase", privacy)
+        self.assertIn("30 days", privacy)
+        self.assertIn("STT", privacy)
+        self.assertIn("Groq", privacy)
+        self.assertNotIn("<script>alert", privacy)
 
     async def test_health_does_not_claim_dependency_readiness(self) -> None:
         health = await self.client.get("/healthz")
@@ -202,6 +223,93 @@ class WebConfigurationTests(unittest.TestCase):
                         host=host,
                         port=port,
                     )
+
+    def test_daki_server_port_is_used_when_railway_port_is_unset(self) -> None:
+        with mock.patch.dict(os.environ, {"SERVER_PORT": "4204"}, clear=False):
+            os.environ.pop("PORT", None)
+            self.assertEqual(_environment_port(), 4204)
+
+
+class PublicSiteTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        root = Path(self.tmpdir.name)
+        kozzyx = root / "kozzyx"
+        kozzyx.mkdir()
+        (kozzyx / "index.html").write_text("<html>kozzyx-home</html>", encoding="utf-8")
+        (kozzyx / "secret.env").write_text("token=nope", encoding="utf-8")
+        (kozzyx / "about.html").write_text("<html>about</html>", encoding="utf-8")
+        kirmy = root / "kirmy"
+        kirmy.mkdir()
+        (kirmy / "index.html").write_text("<html>kirmy-home</html>", encoding="utf-8")
+        wearegays = root / "wearegays"
+        (wearegays / "pages").mkdir(parents=True)
+        (wearegays / "index.html").write_text("<html>wag-home</html>", encoding="utf-8")
+        (wearegays / "nano-terms.html").write_text("<html>terms</html>", encoding="utf-8")
+        (wearegays / "pages" / "wearegays.html").write_text(
+            "<html>pride</html>", encoding="utf-8"
+        )
+        app = create_app(
+            privacy_contact="privacy@example.test",
+            readiness=ReadinessState(),
+            sites_root=root,
+        )
+        self.client = TestClient(TestServer(app))
+        await self.client.start_server()
+
+    async def asyncTearDown(self) -> None:
+        await self.client.close()
+        self.tmpdir.cleanup()
+
+    async def test_host_header_selects_site_and_skips_opsef_csp(self) -> None:
+        response = await self.client.get("/", headers={"Host": "kirmy.org"})
+        self.assertEqual(response.status, 200)
+        self.assertIn("kirmy-home", await response.text())
+        self.assertNotIn("default-src 'none'", response.headers["Content-Security-Policy"])
+        self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
+        self.assertEqual(response.headers["X-Frame-Options"], "DENY")
+
+    async def test_forwarded_host_selects_site_behind_a_proxy(self) -> None:
+        response = await self.client.get(
+            "/",
+            headers={
+                "Host": "paid5.daki.cc:4204",
+                "X-Forwarded-Host": "wearegays.net",
+            },
+        )
+        self.assertEqual(response.status, 200)
+        self.assertIn("wag-home", await response.text())
+
+    async def test_legal_routes_stay_hardened_on_public_hosts(self) -> None:
+        response = await self.client.get("/sefbot", headers={"Host": "kozzyx.org"})
+        self.assertEqual(response.status, 200)
+        self.assertIn("OpSef", await response.text())
+        self.assertIn("default-src 'none'", response.headers["Content-Security-Policy"])
+
+    async def test_dotfiles_and_traversal_are_rejected(self) -> None:
+        blocked = await self.client.get("/secret.env", headers={"Host": "kozzyx.org"})
+        self.assertEqual(blocked.status, 404)
+        self.assertNotIn("token=nope", await blocked.text())
+        traversal = await self.client.get(
+            "/../../secret.env", headers={"Host": "kozzyx.org"}
+        )
+        self.assertEqual(traversal.status, 404)
+
+    async def test_html_extension_fallback_and_wearegays_redirects(self) -> None:
+        about = await self.client.get("/about", headers={"Host": "kozzyx.org"})
+        self.assertEqual(about.status, 200)
+        self.assertIn("about", await about.text())
+        redirected = await self.client.get(
+            "/tos", headers={"Host": "wearegays.net"}, allow_redirects=False
+        )
+        self.assertEqual(redirected.status, 301)
+        self.assertEqual(redirected.headers["Location"], "/nano-terms.html")
+        pride = await self.client.get(
+            "/wearegays", headers={"Host": "www.wearegays.net"}, allow_redirects=False
+        )
+        self.assertEqual(pride.status, 301)
+        self.assertEqual(pride.headers["Location"], "/pages/wearegays.html")
+
 
 if __name__ == "__main__":
     unittest.main()

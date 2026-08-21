@@ -304,7 +304,7 @@ FILES
 ------------------------------------------------------------------------------
  DEPLOY NOTES
 ------------------------------------------------------------------------------
-  - Railway volume at /data for SEFBOT_DB still required for persistence.
+  - Persistent volume or local disk for SEFBOT_DB required for persistence.
   - On deploy, set SEFBOT_MODEL_SMART=llama-3.3-70b-versatile if the service
     still has SEFBOT_MODEL=llama-3.1-8b-instant from older setup.
   - Vision model name must be available on your Groq account; change

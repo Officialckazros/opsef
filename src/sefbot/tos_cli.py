@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from sefbot import blocked
-from sefbot.web import TERMS_URL
+from sefbot.legal import TERMS_URL
 
 HELP = """\
 OpSef ToS break review CLI

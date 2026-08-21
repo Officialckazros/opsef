@@ -53,7 +53,7 @@ PYTHONPATH=src python -m sefbot.bot
 - Privacy: [kozzyx.org/sefbot/privacy](https://kozzyx.org/sefbot/privacy)
 - `/privacy status|opt-in|opt-out|export|delete` remains private and available without accepting the ToS. ToS acceptance is not raw-history consent.
 - Moderation, server rules, raw history, and voice transcription are disabled by default. Voice transcription additionally requires participant consent in the exact guild.
-- The built-in HTTP service exposes `/healthz` for liveness and `/readyz` for sanitized Discord/database readiness. `SEFBOT_PRIVACY_CONTACT` is required; `PORT` defaults to `8080` outside Railway.
+- The built-in HTTP service exposes `/healthz` for liveness and `/readyz` for sanitized Discord/database readiness. `SEFBOT_PRIVACY_CONTACT` defaults to `privacy@opsef.bot`; `PORT` defaults to `8080`.
 - Changing the legal version invalidates earlier acceptance, so users review material policy changes before resuming normal commands.
 
 ## Modular AI features
@@ -64,7 +64,7 @@ A second, self-contained model layer (`services/llm_client.py`) that talks to an
 - **`/act <natural language>`** — moderators can ask for one typed action such as a timeout or ban. The bot shows an ephemeral, mention-safe preview bound to that invoker; only a confirmation within two minutes can proceed. The executor then re-resolves the target and rechecks the exact permission, bot capability, and role hierarchy. Schemas live in `function_registry.py`.
 - **Passive moderation** — disabled until `SEFBOT_SAFETY_ENABLED=1` and an administrator enables it for the guild. Safety GPT is a bounded classifier only: high-confidence flags go to a private staff review with **Delete message** / **Dismiss** controls. The model cannot delete content, warn users, or globally block anyone by itself.
 - **Vision** — `/describe [image] [url] [prompt]` and the right-click **Describe image** message context menu. Uses Qwen vision (`SEFBOT_VISION_MODEL`); one call returns both a description and a moderation flag. Remote URLs must resolve to a public HTTP(S) endpoint, redirects are revalidated, and downloads are streamed under `SEFBOT_VISION_MAX_IMAGE_BYTES`. PNG, JPEG, GIF, and WebP are supported. Cooldown-protected.
-- **Multilingual** — non-English messages are detected with `langdetect` (cheap, never the LLM). In a channel listed in `SEFBOT_MULTILINGUAL_CHANNELS`, Llama 3.3 70B replies in the message's own language; elsewhere the message is translated for the brain as before.
+- **Multilingual** — `!language` / `/language` sets the language the bot replies in (per user, with an optional server default). Non-English messages are also detected with `langdetect` (cheap, never the LLM). In a channel listed in `SEFBOT_MULTILINGUAL_CHANNELS`, and when no language is set, Llama 3.3 70B replies in the message's own language; elsewhere the message is translated for the brain as before.
 - **Voice** — `/join`, `/leave`, and `/say <text>` provide playback/TTS. Live `/stt` is off by default and requires `manage_channels`, guild enablement, and consent from every non-bot participant; the session stops when its controller leaves or consent/channel visibility changes. The released `discord-ext-voice-recv` packages still require a vulnerable PyNaCl version, so the base install keeps PyNaCl ≥ 1.6.2 and safely leaves live receive unavailable until a compatible upstream release exists. Do not downgrade PyNaCl to enable it.
 - **Server rules (approval-gated)** — the optional preset runs only when `SEFBOT_RULES_ENABLED=1`, `SEFBOT_RULES_GUILD` is explicitly configured, and that guild enables it. Findings go to a private review channel. Approval rechecks the action-specific permission (`ban_members`, `kick_members`, `moderate_members`, or `manage_messages`) and bot hierarchy before doing anything; denial, timeout, or restart takes no action.
 
@@ -107,9 +107,9 @@ All bot code lives in `src/sefbot/` (run with `PYTHONPATH=src python -m sefbot.b
 - `rules.py` — server ruleset + approval-gated enforcement (Approve/Deny buttons)
 - `web.py` — legal pages plus liveness/readiness HTTP endpoints
 
-## Deploying on Railway
+## Deployment
 
-`railway.json` runs `PYTHONPATH=src python -m sefbot.bot` and checks `/readyz`, so a deployment is not marked healthy until both Discord and the database are ready. `.python-version` pins production to Python 3.14.7, while `nixpacks.toml` preserves the `python314` setup and installs the hash-locked `requirements.lock`. Set `SEFBOT_PRIVACY_CONTACT`; Railway supplies `PORT`. Since state lives in SQLite, mount a persistent volume and point `SEFBOT_DB` at `/data/sefbot.db`. Startup applies versioned migrations, purges legacy raw history, and enforces the configured retention ceiling before readiness is reported.
+Run `deploy opsef` (or `./scripts/deploy opsef`) to run pre-deployment checks, sync files, and restart the service on Daki. Startup applies versioned migrations, purges legacy raw history, and enforces the configured retention ceiling before readiness is reported.
 
 ## Verification
 

@@ -4,7 +4,7 @@ import test from "node:test";
 import worker from "../src/index.js";
 
 
-const ORIGIN = "https://sefbot-production.up.railway.app";
+const ORIGIN = "https://portal.daki.cc";
 
 test("rejects unknown paths and methods without contacting upstream", async () => {
   const originalFetch = globalThis.fetch;

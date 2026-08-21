@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -142,6 +143,56 @@ class DeploymentValidationTests(unittest.TestCase):
 
         self.assertEqual(len(FakeClient.instances), 1)
         self.assertEqual(FakeClient.instances[0].calls, [])
+
+    def test_websites_project_is_accepted(self) -> None:
+        with mock.patch.object(
+            deploy_script.sys, "argv", ["deploy", "websites", "--dry-run"]
+        ):
+            args = deploy_script.parse_args()
+        self.assertEqual(args.project, "websites")
+        self.assertTrue(args.dry_run)
+
+    def test_assemble_sites_flattens_kozzyx_pages_and_promotes_wearegays_index(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            website = Path(directory) / "website"
+            (website / "kozzyx.org" / "pages").mkdir(parents=True)
+            (website / "kozzyx.org" / "css").mkdir()
+            (website / "kirmy.org").mkdir()
+            (website / "wearegays.net").mkdir()
+            (website / "wearedevsstatus").mkdir()
+            (website / "social").mkdir()
+            (website / "kozzyx.org" / "pages" / "index.html").write_text(
+                "kozzyx", encoding="utf-8"
+            )
+            (website / "kozzyx.org" / "css" / "theme.css").write_text(
+                "body{}", encoding="utf-8"
+            )
+            (website / "kirmy.org" / "index.html").write_text("kirmy", encoding="utf-8")
+            (website / "wearegays.net" / "multi.html").write_text(
+                "wag", encoding="utf-8"
+            )
+            (website / "wearedevsstatus" / "index.html").write_text(
+                "status", encoding="utf-8"
+            )
+            (website / "social" / "index.html").write_text("social", encoding="utf-8")
+            assembled = Path(directory) / "assembled"
+            with mock.patch.object(deploy_script, "WEBSITE_ROOT", website):
+                deploy_script.assemble_sites(assembled)
+            self.assertEqual(
+                (assembled / "kozzyx" / "index.html").read_text(encoding="utf-8"),
+                "kozzyx",
+            )
+            self.assertTrue((assembled / "kozzyx" / "css" / "theme.css").is_file())
+            self.assertEqual(
+                (assembled / "wearegays" / "index.html").read_text(encoding="utf-8"),
+                "wag",
+            )
+            self.assertTrue((assembled / "wearegays" / "status" / "index.html").is_file())
+            self.assertTrue((assembled / "kirmy" / "social" / "index.html").is_file())
+            archive = Path(directory) / "sites-bundle.zip"
+            deploy_script.build_sites_archive(assembled, archive)
+            self.assertGreater(archive.stat().st_size, 0)
+            self.assertTrue(deploy_script.website_digest(archive))
 
 
 if __name__ == "__main__":

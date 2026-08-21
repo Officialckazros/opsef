@@ -90,7 +90,7 @@ INFERX_BASE_URL = (
 
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "ix:deepseek-v4-flash-0731")
 
-DEFAULT_MODEL = "ix:deepseek-v4-flash"
+DEFAULT_MODEL = "ix:deepseek-v4-flash-0731"
 
 MODEL_SMART = DEFAULT_MODEL
 MODEL_FAST = DEFAULT_MODEL
@@ -105,8 +105,7 @@ MODEL_VISION_FALLBACKS = [
         "or:nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free,"
         "or:google/gemma-4-31b-it:free,"
         "or:openrouter/free,"
-        "meta-llama/llama-4-scout-17b-16e-instruct,"
-        "meta-llama/llama-4-maverick-17b-128e-instruct",
+        "qwen/qwen3.6-27b",
     ).split(",") if m.strip()
 ]
 MODEL_EXPERT = DEFAULT_MODEL
@@ -119,7 +118,7 @@ MODEL_BIG_FALLBACKS = [
         "or:nvidia/nemotron-3.5-lightning:free,"
         "or:nvidia/nemotron-3-super-120b-a12b:free,"
         "or:google/gemma-4-31b-it:free,"
-        "llama-3.3-70b-versatile",
+        "openai/gpt-oss-120b",
     ).split(",") if m.strip()
 ]
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -128,7 +127,7 @@ MODEL_EXPERT_FALLBACKS = [
     m.strip() for m in os.getenv(
         "SEFBOT_MODEL_EXPERT_FALLBACKS",
         "mercury-2,celeris-1,or:nvidia/nemotron-3-ultra-550b-a55b:free,openai/gpt-oss-120b,"
-        "or:nvidia/nemotron-3-super-120b-a12b:free,llama-3.3-70b-versatile,"
+        "or:nvidia/nemotron-3-super-120b-a12b:free,qwen/qwen3.6-27b,"
         "cb:gpt-oss-120b",
     ).split(",") if m.strip()
 ]
@@ -151,8 +150,8 @@ MODEL_FALLBACKS = [
         "mercury-2,celeris-1,"
         "or:nvidia/nemotron-3-ultra-550b-a55b:free,"
         "or:nvidia/nemotron-3.5-lightning:free,"
-        "llama-3.3-70b-versatile,openai/gpt-oss-20b,"
-        "llama-3.1-8b-instant,gemini-3.5-flash-lite,"
+        "openai/gpt-oss-120b,openai/gpt-oss-20b,"
+        "qwen/qwen3.6-27b,gemini-3.5-flash-lite,"
         "or:nvidia/nemotron-3-super-120b-a12b:free,"
         "or:openrouter/free,cb:gpt-oss-120b",
     ).split(",") if m.strip()
@@ -161,34 +160,83 @@ MODEL_FALLBACKS = [
 MODEL_FREAKY = DEFAULT_MODEL
 MODEL_FREAKY_FALLBACKS = MODEL_FALLBACKS
 
+# Live Groq *chat* models from GET /openai/v1/models. Speech, transcription,
+# and prompt-guard endpoints cannot run the Discord brain, so they stay out
+# of /model. Llama 3.3 70B Versatile and Llama 3.1 8B Instant were shut down.
+GROQ_DEFAULT = "openai/gpt-oss-120b"
+GROQ_CHAT_MODELS = (
+    ("openai/gpt-oss-120b", "Groq GPT-OSS 120B"),
+    ("openai/gpt-oss-20b", "Groq GPT-OSS 20B"),
+    ("openai/gpt-oss-safeguard-20b", "Groq GPT-OSS Safeguard 20B"),
+    ("qwen/qwen3.6-27b", "Groq Qwen 3.6 27B"),
+    ("groq/compound", "Groq Compound"),
+    ("groq/compound-mini", "Groq Compound Mini"),
+    ("allam-2-7b", "Groq Allam 2 7B"),
+)
+
 MODEL_SWITCHER = {
     "inferx": DEFAULT_MODEL,
     "deepseek": DEFAULT_MODEL,
     "ix": DEFAULT_MODEL,
+    "ix:deepseek-v4-flash": DEFAULT_MODEL,
+    "ix:deepseek-v4-flash-0731": DEFAULT_MODEL,
     "big": MODEL_BIG,
     "nemotron": MODEL_BIG,
     "ultra": MODEL_BIG,
     "free": MODEL_BIG,
     "1m": MODEL_BIG,
-    "groq": "llama-3.3-70b-versatile",
-    "groq-llama": "llama-3.3-70b-versatile",
-    "llama": "llama-3.3-70b-versatile",
-    "llama3": "llama-3.3-70b-versatile",
-    "llama-3.3": "llama-3.3-70b-versatile",
-    "llama-3.3-70b-versatile": "llama-3.3-70b-versatile",
-    "versatile": "llama-3.3-70b-versatile",
-    "70b": "llama-3.3-70b-versatile",
+    "groq": GROQ_DEFAULT,
+    "gpt-oss": GROQ_DEFAULT,
+    "gptoss": GROQ_DEFAULT,
+    "120b": GROQ_DEFAULT,
+    "oss": GROQ_DEFAULT,
+    "fast": "openai/gpt-oss-20b",
+    "20b": "openai/gpt-oss-20b",
+    "qwen": "qwen/qwen3.6-27b",
+    "qwen3": "qwen/qwen3.6-27b",
+    "qwen3.6": "qwen/qwen3.6-27b",
+    "compound": "groq/compound",
+    "compound-mini": "groq/compound-mini",
+    "allam": "allam-2-7b",
+    "safeguard": "openai/gpt-oss-safeguard-20b",
+    "safety": "openai/gpt-oss-safeguard-20b",
+    # Shut down on Groq 2026-08-16; map old picker values onto the replacement.
+    "llama": GROQ_DEFAULT,
+    "llama3": GROQ_DEFAULT,
+    "llama-3.3": GROQ_DEFAULT,
+    "llama-3.3-70b-versatile": GROQ_DEFAULT,
+    "versatile": GROQ_DEFAULT,
+    "70b": GROQ_DEFAULT,
+    "groq-llama": GROQ_DEFAULT,
+    "llama-3.1-8b-instant": "openai/gpt-oss-20b",
 }
+for _mid, _label in GROQ_CHAT_MODELS:
+    MODEL_SWITCHER[_mid] = _mid
+    MODEL_SWITCHER[_mid.lower()] = _mid
+    _tail = _mid.rsplit("/", 1)[-1]
+    MODEL_SWITCHER.setdefault(_tail, _mid)
+    MODEL_SWITCHER.setdefault(_tail.lower(), _mid)
+_GROQ_LABELS = {mid: label for mid, label in GROQ_CHAT_MODELS}
+
+
+def canonical_model(model: str) -> str:
+    """Map a picker alias or stale Groq id onto a live model id."""
+    raw = (model or "").strip()
+    if not raw:
+        return DEFAULT_MODEL
+    return MODEL_SWITCHER.get(raw.lower(), raw)
 
 
 def model_display(model: str) -> str:
     """Human label for a model id (used by !model / /model)."""
+    model = canonical_model(model)
     if model == MODEL_BIG:
         return "free big-brain — NVIDIA Nemotron 3 Ultra 550B (1M context)"
-    if model == DEFAULT_MODEL:
-        return "InferX DeepSeek V4 Flash (`ix:deepseek-v4-flash`)"
-    if model == "llama-3.3-70b-versatile":
-        return "Groq Llama 3.3 70B Versatile (`llama-3.3-70b-versatile`)"
+    if model in (DEFAULT_MODEL, "ix:deepseek-v4-flash", "ix:deepseek-v4-flash-0731"):
+        return "InferX DeepSeek V4 Flash (`ix:deepseek-v4-flash-0731`)"
+    label = _GROQ_LABELS.get(model)
+    if label:
+        return f"{label} (`{model}`)"
     return f"`{model}`"
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
@@ -269,7 +317,7 @@ LLM_API_KEY = (os.getenv("SEFBOT_LLM_API_KEY") or "").strip()
 GROQ_BASE_URL = (os.getenv("SEFBOT_GROQ_BASE_URL") or "https://api.groq.com/openai/v1").rstrip("/")
 
 CHAT_MODEL = os.getenv("SEFBOT_CHAT_MODEL", "gpt-oss-120b")
-FAST_MODEL = os.getenv("SEFBOT_FAST_MODEL", "llama-3.3-70b-versatile")
+FAST_MODEL = os.getenv("SEFBOT_FAST_MODEL", "openai/gpt-oss-20b")
 TOOL_MODEL = os.getenv("SEFBOT_TOOL_MODEL", "gpt-oss-20b")
 VISION_MODEL = os.getenv("SEFBOT_VISION_MODEL", "qwen-3.6-27b")
 SAFETY_MODEL = os.getenv("SEFBOT_SAFETY_MODEL", "openai/gpt-oss-20b")
@@ -278,7 +326,7 @@ SAFETY_MODEL = os.getenv("SEFBOT_SAFETY_MODEL", "openai/gpt-oss-20b")
 
 SAFETY_BASE_URL = (os.getenv("SEFBOT_SAFETY_BASE_URL") or "https://openrouter.ai/api/v1").rstrip("/")
 SAFETY_API_KEY = (os.getenv("SEFBOT_SAFETY_API_KEY") or OPENROUTER_API_KEY).strip()
-MULTILINGUAL_MODEL = os.getenv("SEFBOT_MULTILINGUAL_MODEL", "llama-3.3-70b-versatile")
+MULTILINGUAL_MODEL = os.getenv("SEFBOT_MULTILINGUAL_MODEL", "openai/gpt-oss-20b")
 WHISPER_MODEL = os.getenv("SEFBOT_WHISPER_MODEL", "whisper-large-v3-turbo")
 TTS_MODEL = os.getenv("SEFBOT_TTS_MODEL", "orpheus-3-0.1b-ft")
 TTS_VOICE = os.getenv("SEFBOT_TTS_VOICE", "tara")
@@ -306,7 +354,24 @@ RULES_LLM_MODEL = os.getenv("SEFBOT_RULES_LLM_MODEL", SAFETY_MODEL)
 SYNC_COMMANDS = _bool("SEFBOT_SYNC_COMMANDS", False)
 ALLOW_LOCAL_ENDPOINTS = _bool("SEFBOT_ALLOW_LOCAL_ENDPOINTS", False)
 WEB_HOST = (os.getenv("SEFBOT_WEB_HOST") or "0.0.0.0").strip()  # noqa: S104 - container bind
-WEB_PORT = max(1, min(65535, _int("PORT", 8080)))
+
+
+def _web_port() -> int:
+    """Prefer Railway's PORT, then Daki/Pterodactyl SERVER_PORT."""
+    for key in ("PORT", "SERVER_PORT"):
+        raw = os.getenv(key)
+        if raw is None or str(raw).strip() == "":
+            continue
+        try:
+            port = int(raw)
+        except ValueError:
+            continue
+        if 1 <= port <= 65_535:
+            return port
+    return 8080
+
+
+WEB_PORT = _web_port()
 PRIVACY_CONTACT = (os.getenv("SEFBOT_PRIVACY_CONTACT") or "privacy@opsef.bot").strip()
 CONTENT_RETENTION_DAYS = max(1, min(30, _int("SEFBOT_RETENTION_DAYS", 30)))
 IMPORT_MAX_BYTES = max(1024, min(8_000_000, _int("SEFBOT_IMPORT_MAX_BYTES", 2_000_000)))

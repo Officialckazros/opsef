@@ -17,6 +17,7 @@ import logging
 import queue
 import re
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,7 +30,7 @@ from sefbot import config
 _LOG = logging.getLogger(__name__)
 
 _clients = [
-    Groq(api_key=k, timeout=20.0, max_retries=0) for k in config.GROQ_KEYS
+    Groq(api_key=k, timeout=40.0, max_retries=1) for k in config.GROQ_KEYS
 ]
 _idx_lock = threading.Lock()
 _idx = 0
@@ -45,6 +46,19 @@ _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 
 _ROTATE_ON = ("rate limit", "rate_limit", "429", "too many requests",
               "503", "502", "overloaded", "capacity", "try again")
+_TRANSIENT_MARKERS = _ROTATE_ON + (
+    "500", "504", "529", "empty content", "empty response", "malformed",
+    "timed out", "timeout", "temporarily", "unavailable", "connection reset",
+    "broken pipe", "remote disconnected", "eof occurred", "connection aborted",
+    "provider returned error", "overloaded",
+)
+_FATAL_MARKERS = (
+    "401", "invalid api key", "no groq api key", "no inferx api key",
+    "no celeris api key", "no inception", "no deepseek api key",
+    "no openrouter api key", "no gemini api key", "no cerebras api key",
+    "no anthropic", "no model available",
+)
+_SAME_MODEL_ATTEMPTS = 3
 _MAX_PROVIDER_RESPONSE_BYTES = 4_000_000
 
 ContentPart = Union[str, dict]
@@ -153,8 +167,88 @@ def _read_limited(response) -> bytes:
     return payload
 
 
-_mercury_pool = HTTPSConnectionPool(config.INCEPTION_BASE_URL, timeout=15.0, max_size=20)
-_celeris_pool = HTTPSConnectionPool(config.CELERIS_BASE_URL, timeout=15.0, max_size=20)
+def _http_error(exc: urllib.error.HTTPError, provider: str) -> RuntimeError:
+    """Keep the status and a short body so fallbacks can classify the failure."""
+    body = ""
+    try:
+        raw = _read_limited(exc)
+        body = raw.decode("utf-8", "replace").strip().replace("\n", " ")[:280]
+    except Exception:
+        _LOG.debug("failed to read %s error body", provider, exc_info=True)
+    finally:
+        try:
+            exc.close()
+        except Exception:
+            _LOG.debug("failed to close %s error response", provider, exc_info=True)
+    extra = f": {body}" if body else ""
+    return RuntimeError(f"{provider} request failed ({exc.code}){extra}")
+
+
+def _choice_text(payload, provider: str) -> str:
+    """Pull the assistant text out of an OpenAI-style chat completion body.
+
+    DeepSeek V4 (and some OpenRouter/Cerebras hosts) can return HTTP 200 with
+    an ``error`` object, ``content: null``, or reasoning-only output. Those
+    must raise so the caller retries or fails over instead of treating silence
+    as a successful reply.
+    """
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{provider} returned a malformed response")
+    err = payload.get("error")
+    if err:
+        if isinstance(err, dict):
+            msg = err.get("message") or err.get("code") or json.dumps(err)[:200]
+            code = err.get("code") or err.get("status") or err.get("type") or "error"
+            raise RuntimeError(f"{provider} request failed ({code}: {msg})")
+        raise RuntimeError(f"{provider} request failed ({err})")
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError(f"{provider} returned a malformed response")
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    msg = first.get("message") if isinstance(first.get("message"), dict) else {}
+    text = msg.get("content")
+    if isinstance(text, list):
+        text = "".join(
+            str(p.get("text") or "")
+            for p in text
+            if isinstance(p, dict)
+        )
+    text = str(text or "").strip()
+    if not text:
+        for key in ("reasoning_content", "reasoning"):
+            alt = msg.get(key) or first.get(key)
+            if alt and str(alt).strip():
+                text = str(alt).strip()
+                break
+    if not text:
+        raise RuntimeError(f"{provider}: empty content")
+    return text
+
+
+def _is_fatal(e: Exception) -> bool:
+    s = str(e).lower()
+    return any(m in s for m in _FATAL_MARKERS)
+
+
+def _is_transient(e: Exception) -> bool:
+    """True when the same model is worth another attempt."""
+    if _is_fatal(e):
+        return False
+    s = str(e).lower()
+    if any(x in s for x in ("404", "not found")):
+        return False
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in (408, 409, 425, 429, 500, 502, 503, 504, 529)
+    if isinstance(e, (TimeoutError, ConnectionError, BrokenPipeError,
+                      ConnectionResetError)):
+        return True
+    if isinstance(e, urllib.error.URLError) and not isinstance(e, urllib.error.HTTPError):
+        return True
+    return any(m in s for m in _TRANSIENT_MARKERS)
+
+
+_mercury_pool = HTTPSConnectionPool(config.INCEPTION_BASE_URL, timeout=25.0, max_size=20)
+_celeris_pool = HTTPSConnectionPool(config.CELERIS_BASE_URL, timeout=25.0, max_size=20)
 
 
 def _is_celeris(model: str) -> bool:
@@ -241,13 +335,11 @@ def _celeris_generate(model, system, messages, max_tokens, temperature) -> str:
 
     if not raw:
         raise RuntimeError("celeris: empty response")
-    d = json.loads(raw)
-    if "choices" not in d:
-        raise RuntimeError("celeris returned a malformed response")
-    text = (d["choices"][0].get("message") or {}).get("content")
-    if not text or not str(text).strip():
-        raise RuntimeError("celeris: empty content")
-    return str(text).strip()
+    try:
+        d = json.loads(raw)
+    except json.JSONDecodeError:
+        raise RuntimeError("celeris returned a malformed response") from None
+    return _choice_text(d, "celeris")
 
 
 def _mercury_generate(model, system, messages, max_tokens, temperature) -> str:
@@ -312,14 +404,11 @@ def _mercury_generate(model, system, messages, max_tokens, temperature) -> str:
 
     if not raw:
         raise RuntimeError("mercury: empty response")
-
-    d = json.loads(raw)
-    if "choices" not in d:
-        raise RuntimeError("mercury returned a malformed response")
-    text = (d["choices"][0].get("message") or {}).get("content")
-    if not text or not str(text).strip():
-        raise RuntimeError("mercury: empty content")
-    return str(text).strip()
+    try:
+        d = json.loads(raw)
+    except json.JSONDecodeError:
+        raise RuntimeError("mercury returned a malformed response") from None
+    return _choice_text(d, "mercury")
 
 
 def _groq_generate(model, system, messages, max_tokens, temperature) -> str:
@@ -336,7 +425,14 @@ def _groq_generate(model, system, messages, max_tokens, temperature) -> str:
                 model=model, max_tokens=max_tokens,
                 temperature=temperature, messages=full,
             )
-            return (resp.choices[0].message.content or "").strip()
+            msg = resp.choices[0].message
+            text = (msg.content or "").strip()
+            if not text:
+                alt = getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None)
+                text = str(alt or "").strip()
+            if not text:
+                raise RuntimeError("groq: empty content")
+            return text
         except Exception as e:
             last = e
             if _is_rate_limited(e):
@@ -421,10 +517,11 @@ def _gemini_generate(model, system, messages, max_tokens, temperature) -> str:
                 text = "".join(p.get("text", "") for p in parts).strip()
                 if text:
                     return text
-            return ""
+            last = RuntimeError("gemini: empty content")
+            continue
         except urllib.error.HTTPError as e:
-            last = RuntimeError(f"gemini request failed ({e.code})")
-            if e.code in (429, 500, 502, 503):
+            last = _http_error(e, "gemini")
+            if e.code in (429, 500, 502, 503, 504):
                 continue
             raise last
         except Exception as e:
@@ -474,14 +571,10 @@ def _cerebras_generate(model, system, messages, max_tokens, temperature) -> str:
         with urllib.request.urlopen(req, timeout=20) as response:  # noqa: S310
             d = json.loads(_read_limited(response))
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"cerebras request failed ({e.code})") from None
-
-    if "choices" not in d:
-        raise RuntimeError("cerebras returned a malformed response")
-    text = (d["choices"][0].get("message") or {}).get("content")
-    if not text or not str(text).strip():
-        raise RuntimeError("cerebras: empty content")
-    return str(text).strip()
+        raise _http_error(e, "cerebras") from None
+    except json.JSONDecodeError:
+        raise RuntimeError("cerebras returned a malformed response") from None
+    return _choice_text(d, "cerebras")
 
 
 def _is_openrouter(model: str) -> bool:
@@ -549,104 +642,138 @@ def _openrouter_generate(model, system, messages, max_tokens, temperature) -> st
         with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
             d = json.loads(_read_limited(response))
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"openrouter request failed ({e.code})") from None
-
-    if "choices" not in d:
-        raise RuntimeError("openrouter returned a malformed response")
-    text = (d["choices"][0].get("message") or {}).get("content")
-    if not text or not str(text).strip():
-        raise RuntimeError("openrouter: empty content")
-    return str(text).strip()
+        raise _http_error(e, "openrouter") from None
+    except json.JSONDecodeError:
+        raise RuntimeError("openrouter returned a malformed response") from None
+    return _choice_text(d, "openrouter")
 
 
 def _is_deepseek(model: str) -> bool:
     return str(model).strip().lower().startswith("deepseek")
 
 
+def _openai_messages(system, messages) -> list:
+    return ([{"role": "system", "content": system}] if system else []) + [
+        {
+            "role": m.get("role", "user"),
+            "content": (
+                " ".join(
+                    p.get("text", "")
+                    for p in m["content"]
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+                if isinstance(m.get("content"), list)
+                else str(m.get("content"))
+            ),
+        }
+        for m in messages
+    ]
+
+
+def _post_json(url: str, headers: dict, payload: dict, timeout: float, provider: str) -> dict:
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(  # noqa: S310 -- caller passes a validated HTTPS provider URL
+        url, data=data, headers=headers,
+    )
+    try:
+        # Host is a configured provider base (InferX/DeepSeek), not user input.
+        with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
+            return json.loads(_read_limited(response))
+    except urllib.error.HTTPError as e:
+        raise _http_error(e, provider) from None
+    except json.JSONDecodeError:
+        raise RuntimeError(f"{provider} returned a malformed response") from None
+    except (TimeoutError, urllib.error.URLError) as e:
+        raise RuntimeError(f"{provider} request failed (timeout)") from e
+
+
+def _chat_without_thinking(
+    url: str,
+    headers: dict,
+    model: str,
+    system,
+    messages,
+    max_tokens,
+    temperature,
+    provider: str,
+    timeout: float = 45,
+) -> str:
+    """OpenAI-style chat with DeepSeek thinking turned off.
+
+    V4 Flash thinks at high effort by default. Those reasoning tokens count
+    against max_tokens, so a growing Discord thread often comes back HTTP 200
+    with empty content — which used to surface as "brain hiccuped". Disable
+    thinking for chat; if the host 400s on the extra field, retry without it.
+    """
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": _openai_messages(system, messages),
+        "thinking": {"type": "disabled"},
+    }
+    try:
+        return _choice_text(_post_json(url, headers, payload, timeout, provider), provider)
+    except RuntimeError as e:
+        if "request failed (400)" not in str(e) and "request failed (422)" not in str(e):
+            raise
+        payload.pop("thinking", None)
+        return _choice_text(_post_json(url, headers, payload, timeout, provider), provider)
+
+
 def _deepseek_generate(model, system, messages, max_tokens, temperature) -> str:
     """DeepSeek (OpenAI-compatible). Used by !ask and the assistant command."""
     if not config.DEEPSEEK_API_KEY:
         raise RuntimeError("no deepseek api key configured")
-
-    full = ([{"role": "system", "content": system}] if system else []) + [
-        {"role": m.get("role", "user"),
-         "content": (" ".join(p.get("text", "") for p in m["content"]
-                              if isinstance(p, dict) and p.get("type") == "text")
-                     if isinstance(m.get("content"), list) else str(m.get("content")))}
-        for m in messages
-    ]
-    body = json.dumps({
-        "model": model,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "messages": full,
-    }).encode()
-    req = urllib.request.Request(  # noqa: S310 -- validated provider base URL
-        config.DEEPSEEK_BASE_URL + "/chat/completions", data=body,
-        headers={
+    return _chat_without_thinking(
+        config.DEEPSEEK_BASE_URL + "/chat/completions",
+        {
             "Authorization": f"Bearer {config.DEEPSEEK_API_KEY}",
             "Content-Type": "application/json",
             "User-Agent": "sefbot/1.0",
         },
+        model,
+        system,
+        messages,
+        max_tokens,
+        temperature,
+        "deepseek",
     )
-    try:
-        # Configuration validation restricts this base URL to HTTPS (or explicit dev localhost).
-        with urllib.request.urlopen(req, timeout=30) as response:  # noqa: S310
-            d = json.loads(_read_limited(response))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"deepseek request failed ({e.code})") from None
-
-    if "choices" not in d:
-        raise RuntimeError("deepseek returned a malformed response")
-    text = (d["choices"][0].get("message") or {}).get("content")
-    if not text or not str(text).strip():
-        raise RuntimeError("deepseek: empty content")
-    return str(text).strip()
 
 
 def _is_inferx(model: str) -> bool:
     return str(model).strip().lower().startswith("ix:")
 
 
+def _inferx_upstream_model(model: str) -> str:
+    """Map `ix:` aliases onto the InferX catalog id."""
+    m = str(model or "").strip()
+    if m.lower().startswith("ix:"):
+        m = m[3:]
+    if m in ("deepseek-v4-flash", "deepseek-v4-flash-latest", "deepseek-v4",
+             "deepseek-flash", ""):
+        return "deepseek-v4-flash-0731"
+    return m or "deepseek-v4-flash-0731"
+
+
 def _inferx_generate(model, system, messages, max_tokens, temperature) -> str:
-    """InferX (OpenAI-compatible). Serves the deepseek model for !ask/assistant."""
+    """InferX (OpenAI-compatible). Default brain: DeepSeek V4 Flash."""
     if not config.INFERX_API_KEY:
         raise RuntimeError("no inferx api key configured")
-
-    full = ([{"role": "system", "content": system}] if system else []) + [
-        {"role": m.get("role", "user"),
-         "content": (" ".join(p.get("text", "") for p in m["content"]
-                              if isinstance(p, dict) and p.get("type") == "text")
-                     if isinstance(m.get("content"), list) else str(m.get("content")))}
-        for m in messages
-    ]
-    body = json.dumps({
-        "model": model[3:],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "messages": full,
-    }).encode()
-    req = urllib.request.Request(  # noqa: S310 -- validated provider base URL
-        config.INFERX_BASE_URL + "/chat/completions", data=body,
-        headers={
+    return _chat_without_thinking(
+        config.INFERX_BASE_URL + "/chat/completions",
+        {
             "Authorization": f"Bearer {config.INFERX_API_KEY}",
             "Content-Type": "application/json",
             "User-Agent": "sefbot/1.0",
         },
+        _inferx_upstream_model(model),
+        system,
+        messages,
+        max_tokens,
+        temperature,
+        "inferx",
     )
-    try:
-        # Configuration validation restricts this base URL to HTTPS (or explicit dev localhost).
-        with urllib.request.urlopen(req, timeout=30) as response:  # noqa: S310
-            d = json.loads(_read_limited(response))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"inferx request failed ({e.code})") from None
-
-    if "choices" not in d:
-        raise RuntimeError("inferx returned a malformed response")
-    text = (d["choices"][0].get("message") or {}).get("content")
-    if not text or not str(text).strip():
-        raise RuntimeError("inferx: empty content")
-    return str(text).strip()
 
 
 def deepseek_configured() -> bool:
@@ -717,7 +844,7 @@ def _generate(requested, system, messages, max_tokens, temperature,
     pool = config.MODEL_FALLBACKS if fallbacks is None else fallbacks
     chain = [requested] + [m for m in pool if m != requested]
     last = None
-    for i, model in enumerate(chain):
+    for model in chain:
         if _is_mercury(model) and not config.INCEPTION_API_KEY:
             continue
         if _is_celeris(model) and not config.CELERIS_API_KEY:
@@ -746,34 +873,46 @@ def _generate(requested, system, messages, max_tokens, temperature,
             and not _clients
         ):
             continue
-        try:
-            if _is_mercury(model):
-                fn = _mercury_generate
-            elif _is_celeris(model):
-                fn = _celeris_generate
-            elif _is_anthropic(model):
-                fn = _anthropic_generate
-            elif _is_cerebras(model):
-                fn = _cerebras_generate
-            elif _is_openrouter(model):
-                fn = _openrouter_generate
-            elif _is_inferx(model):
-                fn = _inferx_generate
-            elif _is_deepseek(model):
-                fn = _deepseek_generate
-            elif _is_gemini(model):
-                fn = _gemini_generate
-            else:
-                fn = _groq_generate
-            out = fn(model, system, messages, max_tokens, temperature)
-            if i:
-                print(f"[failover] {requested} exhausted -> served by {model}")
-            return out
-        except Exception as e:
-            last = e
-            if i == len(chain) - 1:
-                raise
-            continue
+        if _is_mercury(model):
+            fn = _mercury_generate
+        elif _is_celeris(model):
+            fn = _celeris_generate
+        elif _is_anthropic(model):
+            fn = _anthropic_generate
+        elif _is_cerebras(model):
+            fn = _cerebras_generate
+        elif _is_openrouter(model):
+            fn = _openrouter_generate
+        elif _is_inferx(model):
+            fn = _inferx_generate
+        elif _is_deepseek(model):
+            fn = _deepseek_generate
+        elif _is_gemini(model):
+            fn = _gemini_generate
+        else:
+            fn = _groq_generate
+        for attempt in range(_SAME_MODEL_ATTEMPTS):
+            try:
+                out = fn(model, system, messages, max_tokens, temperature)
+                if not out or not str(out).strip():
+                    raise RuntimeError(f"{model}: empty content")
+                if model != requested:
+                    print(f"[failover] {requested} exhausted -> served by {model}")
+                elif attempt:
+                    print(f"[retry] {model} recovered on attempt {attempt + 1}")
+                return out
+            except Exception as e:
+                last = e
+                _LOG.warning(
+                    "provider %s attempt %s/%s failed (%s): %s",
+                    model, attempt + 1, _SAME_MODEL_ATTEMPTS,
+                    type(e).__name__, str(e)[:240],
+                )
+                if _is_transient(e) and attempt < _SAME_MODEL_ATTEMPTS - 1:
+                    time.sleep(0.4 * (attempt + 1))
+                    continue
+                break
+        continue
     if last:
         raise last
     raise RuntimeError("no model available")
@@ -782,22 +921,26 @@ def _generate(requested, system, messages, max_tokens, temperature,
 def friendly_error(e: Exception) -> str:
     """Turn an API error into something a human wants to read."""
     s = str(e)
-    _LOG.warning("provider call failed (%s)", type(e).__name__)
+    sl = s.lower()
+    _LOG.warning("provider call failed (%s): %s", type(e).__name__, s[:400])
     if _is_rate_limited(e):
-        import re as _re
-        m = _re.search(r"try again in ([0-9hms.]+)", s, _re.I)
+        m = re.search(r"try again in ([0-9hms.]+)", s, re.I)
         wait = f" try again in {m.group(1)}." if m else " give it a few minutes."
         return f"i'm out of tokens for now -{wait}"
-    if "credit balance is too low" in s.lower():
+    if "credit balance is too low" in sl:
         return "the paid model's out of credit. add credits at console.anthropic.com/settings/billing"
-    if "401" in s or "invalid api key" in s.lower():
+    if "401" in s or "invalid api key" in sl:
         return "my api key got rejected. someone check the AI keys (Mercury/Celeris/Groq)."
-    if "mercury" in s.lower() and ("402" in s or "credit" in s.lower() or "quota" in s.lower()):
+    if "mercury" in sl and ("402" in s or "credit" in sl or "quota" in sl):
         return "mercury is out of quota/credits — check inception platform billing."
-    if "celeris" in s.lower() and ("401" in s or "invalid" in s.lower()):
+    if "celeris" in sl and ("401" in s or "invalid" in sl):
         return "celeris key rejected — regenerate at console.celeris.ai"
-    if "deepseek" in s.lower() and ("401" in s or "invalid" in s.lower()):
+    if "deepseek" in sl and ("401" in s or "invalid" in sl):
         return "deepseek key rejected — check DEEPSEEK_API_KEY."
+    if "timed out" in sl or "timeout" in sl:
+        return "that took too long — ping me again"
+    if "context" in sl and any(w in sl for w in ("length", "too long", "maximum", "too large")):
+        return "that thread's too long for my brain. !resetconvo and try again"
     return "my brain hiccuped. try again in a moment"
 
 
@@ -864,7 +1007,7 @@ async def chat(
 async def structured(
     system: str,
     messages: List[dict],
-    max_tokens: int = 1100,
+    max_tokens: int = 2000,
     temperature: float = 0.8,
     tier: str = "smart",
     model: Optional[str] = None,
@@ -1077,15 +1220,28 @@ async def web_search(query: str, k: int = 5) -> dict:
 
 
 def _extract_json(text: str) -> Optional[dict]:
+    if not text or not str(text).strip():
+        return None
     text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
     except json.JSONDecodeError:
         pass
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         try:
-            return json.loads(match.group(0))
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
-            return None
+            pass
+    # Truncated JSON from a token cap: salvage the chat reply if present.
+    m = re.search(r'"response"\s*:\s*"((?:\\.|[^"\\])*)"', text)
+    if m:
+        try:
+            return {"response": json.loads(f'"{m.group(1)}"')}
+        except json.JSONDecodeError:
+            return {"response": m.group(1)}
     return None

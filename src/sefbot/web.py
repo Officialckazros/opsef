@@ -1,9 +1,12 @@
-"""Small public web surface for OpSef legal and health endpoints.
+"""Public web surface for OpSef legal/health endpoints and static sites.
 
 The Discord client owns :class:`WebService` in production and supplies a
 readiness callback for its Discord and database state.  Keeping the HTTP
 surface here avoids importing Discord or the bot's configuration at module
 import time, which also makes health checks safe during partial startup.
+
+When a ``sites/`` tree is present, Host-based virtual hosts serve kozzyx.org,
+kirmy.org, and wearegays.net from that tree. Legal routes stay on ``/sefbot``.
 """
 
 from __future__ import annotations
@@ -18,17 +21,21 @@ import logging
 import os
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Final, TypeAlias
 
 from aiohttp import web
 
-log = logging.getLogger("sefbot.web")
+from sefbot.legal import privacy_inner, terms_inner
+from sefbot.sites import (
+    SITE_FLAG,
+    apply_site_headers,
+    attach_site_routes,
+    resolve_sites_root,
+    serve_public_site,
+)
 
-LEGAL_VERSION: Final = "2.0"
-LEGAL_EFFECTIVE_DATE: Final = "19 August 2026"
-PUBLIC_BASE_URL: Final = "https://kozzyx.org/sefbot"
-TERMS_URL: Final = f"{PUBLIC_BASE_URL}/terms"
-PRIVACY_URL: Final = f"{PUBLIC_BASE_URL}/privacy"
+log = logging.getLogger("sefbot.web")
 DEFAULT_HOST: Final = "0.0.0.0"  # noqa: S104, RUF100 - container listener
 DEFAULT_PORT: Final = 8080
 MAX_REQUEST_BYTES: Final = 1_024
@@ -36,10 +43,14 @@ READINESS_TIMEOUT_SECONDS: Final = 2.0
 
 _STYLE: Final = """
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#111;color:#eee}
-body{max-width:52rem;margin:4rem auto;padding:0 1.2rem;line-height:1.65}
-a{color:#8fc7ff}h1,h2{line-height:1.2}nav{display:flex;gap:1rem;flex-wrap:wrap}
+body{max-width:52rem;margin:4rem auto;padding:0 1.2rem 4rem;line-height:1.65}
+a{color:#8fc7ff}h1,h2,h3{line-height:1.25}h2{margin-top:2rem}h3{margin-top:1.3rem}
+nav{display:flex;gap:1rem;flex-wrap:wrap}
 .card{border:1px solid #333;border-radius:.8rem;padding:1rem 1.2rem;background:#181818}
 code{background:#222;padding:.1rem .3rem;border-radius:.25rem}
+table{width:100%;border-collapse:collapse;font-size:.92rem;margin:1rem 0}
+th,td{border:1px solid #333;padding:.45rem .55rem;text-align:left;vertical-align:top}
+th{background:#1a1a1a}ul{padding-left:1.2rem}
 """.strip()
 _STYLE_HASH: Final = base64.b64encode(
     hashlib.sha256(_STYLE.encode("utf-8")).digest()
@@ -95,73 +106,24 @@ def _landing_page() -> str:
         """
 <h1>OpSef Discord bot</h1>
 <div class="card">
-  <p>OpSef is a Discord assistant with opt-in memory and administration tools.</p>
-  <p>Read the Terms and Privacy Notice before using the bot. Health endpoints
-  report service availability without exposing user, guild, or provider data.</p>
+  <p>OpSef is a Discord assistant with opt-in memory and administration tools.
+  Ordinary chat cannot execute Discord actions. Raw history is off until a
+  server enables it and you opt in separately from the Terms.</p>
+  <p>Read the Terms and Privacy Notice before using the bot. They describe the
+  running code, including third-party AI providers, strike/blocks, and what
+  deletion does not erase. Health endpoints report service availability
+  without exposing user, guild, or provider data.</p>
 </div>
 """,
     )
 
 
 def _terms_page(contact: str) -> str:
-    safe_contact = html.escape(contact)
-    return _document(
-        "Terms of Service",
-        f"""
-<h1>Terms of Service</h1>
-<p><strong>Version {LEGAL_VERSION}</strong> — effective {LEGAL_EFFECTIVE_DATE}</p>
-<p>By accepting these terms, you may use OpSef where it is installed and where
-you have permission to interact with it. You must follow Discord's terms,
-applicable law, and the rules of the relevant server.</p>
-<h2>Acceptable use</h2>
-<p>Do not use OpSef to harass people, bypass access controls, distribute illegal
-material, expose private information, or interfere with Discord or third-party
-services. Automated output can be wrong; verify it before relying on it.</p>
-<h2>Administrative actions</h2>
-<p>State-changing actions require an authorized user to review and confirm a
-preview. Server administrators remain responsible for configuration and for
-actions they approve.</p>
-<h2>Availability and changes</h2>
-<p>The service is provided without a guarantee of uninterrupted availability.
-Material changes require acceptance of a new terms version.</p>
-<h2>Contact</h2>
-<p>Questions or reports: <span>{safe_contact}</span>.</p>
-""",
-    )
+    return _document("Terms of Service", terms_inner(contact))
 
 
 def _privacy_page(contact: str) -> str:
-    safe_contact = html.escape(contact)
-    return _document(
-        "Privacy Notice",
-        f"""
-<h1>Privacy Notice</h1>
-<p><strong>Version {LEGAL_VERSION}</strong> — effective {LEGAL_EFFECTIVE_DATE}</p>
-<h2>Data processed</h2>
-<p>Discord supplies identifiers, display names, command inputs, and message or
-attachment content needed to answer a request. Moderation and voice features
-are disabled until a server administrator enables them. Enabled AI features
-may send the minimum required request content to configured AI, search, speech,
-or media providers. OpSef does not sell personal data.</p>
-<h2>Memory and retention</h2>
-<p>Raw message history is off by default and requires both server enablement and
-the user's separate opt-in. Opted-in raw history is retained for no more than
-30 days. Terms acceptance alone is not consent to raw-history storage. Explicit
-memories and settings remain until they are deleted or are no longer needed to
-provide the service. Minimal security and action-audit records may be retained
-to investigate abuse without storing unnecessary message content.</p>
-<h2>Controls</h2>
-<p>Use <code>/privacy status</code>, <code>/privacy opt-in</code>,
-<code>/privacy opt-out</code>, <code>/privacy export</code>, or
-<code>/privacy delete</code>. Exports are private, and deletion covers data
-owned by the requesting user. Discord and configured providers may keep their
-own operational records under their respective policies.</p>
-<h2>Security and contact</h2>
-<p>Access to another member's current-server intelligence is restricted to
-authorized moderators. Report privacy or security concerns to
-<span>{safe_contact}</span>.</p>
-""",
-    )
+    return _document("Privacy Notice", privacy_inner(contact))
 
 
 def _html_response(content: str) -> web.Response:
@@ -199,6 +161,20 @@ def _normalize_bind_host(host: object) -> str:
 
 
 @web.middleware
+async def _site_fallback(
+    request: web.Request,
+    handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
+) -> web.StreamResponse:
+    try:
+        return await handler(request)
+    except web.HTTPNotFound:
+        sites_root = request.app.get("sites_root")
+        if not isinstance(sites_root, Path) or not sites_root.is_dir():
+            raise
+        return await serve_public_site(request, sites_root)
+
+
+@web.middleware
 async def _security_headers(
     request: web.Request,
     handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
@@ -212,6 +188,12 @@ async def _security_headers(
             text=error.text,
             headers=error.headers,
         )
+        if request.get(SITE_FLAG):
+            apply_site_headers(response, request.path)
+            return response
+    if request.get(SITE_FLAG):
+        apply_site_headers(response, request.path)
+        return response
     response.headers["Content-Security-Policy"] = (
         "default-src 'none'; base-uri 'none'; form-action 'none'; "
         f"style-src 'sha256-{_STYLE_HASH}'; frame-ancestors 'none'"
@@ -264,7 +246,10 @@ async def _resolve_readiness(provider: ReadinessProvider) -> dict[str, bool]:
 
 
 def create_app(
-    *, privacy_contact: str, readiness: ReadinessProvider | None = None
+    *,
+    privacy_contact: str,
+    readiness: ReadinessProvider | None = None,
+    sites_root: str | os.PathLike[str] | None = None,
 ) -> web.Application:
     """Create the HTTP application without starting a listening socket."""
 
@@ -283,7 +268,8 @@ def create_app(
     if not callable(readiness_provider):
         raise WebConfigurationError("readiness provider must be callable")
     app = web.Application(
-        middlewares=[_security_headers], client_max_size=MAX_REQUEST_BYTES
+        middlewares=[_security_headers, _site_fallback],
+        client_max_size=MAX_REQUEST_BYTES,
     )
 
     async def landing(_request: web.Request) -> web.Response:
@@ -327,6 +313,7 @@ def create_app(
     app.router.add_get("/opsef-privacy.html", redirect_privacy)
     app.router.add_get("/healthz", health)
     app.router.add_get("/readyz", ready)
+    attach_site_routes(app, resolve_sites_root(sites_root))
     return app
 
 
@@ -378,14 +365,18 @@ class WebService:
 
 
 def _environment_port() -> int:
-    raw_port = os.getenv("PORT", str(DEFAULT_PORT))
-    try:
-        port = int(raw_port)
-    except ValueError as exc:
-        raise WebConfigurationError("PORT must be an integer") from exc
-    if not 1 <= port <= 65_535:
-        raise WebConfigurationError("PORT must be between 1 and 65535")
-    return port
+    for key in ("PORT", "SERVER_PORT"):
+        raw_port = os.getenv(key)
+        if raw_port is None or str(raw_port).strip() == "":
+            continue
+        try:
+            port = int(raw_port)
+        except ValueError as exc:
+            raise WebConfigurationError(f"{key} must be an integer") from exc
+        if not 1 <= port <= 65_535:
+            raise WebConfigurationError(f"{key} must be between 1 and 65535")
+        return port
+    return DEFAULT_PORT
 
 
 def main() -> None:

@@ -1,4 +1,4 @@
-const DEFAULT_ORIGIN = "https://sefbot-production.up.railway.app";
+const DEFAULT_ORIGIN = "https://portal.daki.cc";
 const ALLOWED_ORIGINS = new Set([DEFAULT_ORIGIN]);
 const PUBLIC_HOSTS = new Set(["kozzyx.org", "www.kozzyx.org"]);
 const UPSTREAM_TIMEOUT_MS = 8_000;

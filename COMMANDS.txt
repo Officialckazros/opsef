@@ -9,6 +9,7 @@
 @SefBot <message>        Chat with it in a server (mention it).
 <message>  (in a DM)     Chat with it in a direct message.
 Attach image + mention   Vision model describes the image; brain uses it.
+Attach .txt + mention    Model reads, analyzes, or summarizes the text file.
 React 👍 / 👎 on a reply  Feedback — learns + adjusts bond with you.
 Reply "correction: ..." Explicit correction stored in the exact scope.
 
@@ -70,6 +71,21 @@ Notes:
 !ask <question>          Ask the DeepSeek V4 Flash model directly (no persona).
 !assistant <request>     ONE-SHOT helpful mode (runs on DeepSeek V4 Flash).
 !assist <request>        Alias of !assistant.
+
+!language [name]         Set the language the bot replies to you in
+                         (`!language hebrew`, `!language es`, `!language ja`).
+                         `!language` shows current. `!language reset` clears
+                         yours (falls back to the server default / English).
+                         `!language list` shows known names/codes.
+                         `!language server <name>` (manage server) sets a
+                         default for people who haven't picked their own.
+                         Alias: `!lang`  (also: slash `/language`, `/lang`)
+
+!ckazros <anything>      Owner-only. Does whatever you ask. Standing orders
+                         (example: `!ckazros speak in hebrew from now`) apply
+                         to every later reply until `!ckazros clear`.
+                         `!ckazros` / `status` lists orders; `undo` pops last.
+                         (also: slash `/ckazros`)
 
 Normal @mentions / DMs stay full chaotic SefBot. Only the !assistant command
 drops the savage tone and answers as a clear, compliant helper for THAT reply

@@ -17,7 +17,7 @@ import time
 from typing import Optional, Tuple
 
 from sefbot import config, db
-from sefbot.web import LEGAL_VERSION, PRIVACY_URL, TERMS_URL
+from sefbot.legal import LEGAL_VERSION, PRIVACY_URL, TERMS_URL
 
 TOS_VERSION = LEGAL_VERSION
 TOS_URL = TERMS_URL

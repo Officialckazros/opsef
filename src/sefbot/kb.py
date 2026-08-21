@@ -16,7 +16,7 @@ top-k passages for a query, which `brain.build_system` injects as authoritative
 reference facts.
 
 Everything lives in the same SQLite file as the rest of the brain (`db.conn()`),
-so it persists on the same Railway volume with zero extra config.
+so it persists across restarts with zero extra config.
 """
 import logging
 import re

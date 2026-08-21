@@ -17,4 +17,4 @@ routes = [
 ]
 
 [vars]
-SEFBOT_ORIGIN = "https://sefbot-production.up.railway.app"
+SEFBOT_ORIGIN = "https://portal.daki.cc"

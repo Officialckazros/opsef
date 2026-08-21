@@ -11,7 +11,7 @@ kv            : misc key/value (mood, lurk timers, etc.)
 relationships : per-user bond score, nickname, grudge
 conversations : short-term user↔bot turns
 quotes        : hall of shame / saved lines
-guild_settings: per-server config (persona, lurk, etc.)
+guild_settings: per-server config (persona, lurk, language, etc.)
 """
 import json
 import math
@@ -989,6 +989,7 @@ _DEFAULT_GUILD = {
     "approval_channel": "",
     "modlog_channel": "",
     "retention_days": MAX_RETENTION_DAYS,
+    "language": "",
 }
 
 
